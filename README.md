@@ -1,6 +1,6 @@
-# EpollRequestBench
+# TcpEpollRequestBench
 
-EpollRequestBench is a C++23/Linux project for learning, validating, and
+TcpEpollRequestBench is a C++23/Linux project for learning, validating, and
 measuring a scalable TCP request/response design. It includes an `epoll`-based
 server and a concurrent load-test client that can run on the same machine or on
 different machines.
