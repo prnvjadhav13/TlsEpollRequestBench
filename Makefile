@@ -25,10 +25,9 @@ PERFORMANCE_LDFLAGS := -flto
 
 .DEFAULT_GOAL := production
 
-.PHONY: all debug development sanitizer production release performance \
-	all-variants clean help
+.PHONY: all debug development sanitizer production release performance clean help
 
-all: production
+all: debug sanitizer production performance
 
 development: debug
 
@@ -41,8 +40,6 @@ sanitizer: $(SANITIZER_DIR)/tcp_server_epoll $(SANITIZER_DIR)/tcp_client
 production: $(PRODUCTION_DIR)/tcp_server_epoll $(PRODUCTION_DIR)/tcp_client
 
 performance: $(PERFORMANCE_DIR)/tcp_server_epoll $(PERFORMANCE_DIR)/tcp_client
-
-all-variants: debug sanitizer production performance
 
 $(DEBUG_DIR) $(SANITIZER_DIR) $(PRODUCTION_DIR) $(PERFORMANCE_DIR):
 	mkdir -p $@
@@ -80,7 +77,7 @@ help:
 	@echo "  make sanitizer     AddressSanitizer + UndefinedBehaviorSanitizer build"
 	@echo "  make production    Optimized, portable, hardened production-test build (default)"
 	@echo "  make performance   Maximum local-CPU optimization for benchmarking"
-	@echo "  make all-variants  Build every variant"
+	@echo "  make all           Build every variant"
 	@echo "  make clean         Remove the build directory"
 	@echo
 	@echo "Override the compiler with: make CXX=/path/to/g++ <target>"
