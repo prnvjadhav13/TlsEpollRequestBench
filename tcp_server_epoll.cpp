@@ -60,15 +60,19 @@ constexpr auto kGraceShutdownTimeout = std::chrono::seconds(30);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 constexpr auto kAcceptCapacityBackoff = std::chrono::milliseconds(10);
 
+// Describes the process-wide transition from accepting traffic, through a
+// graceful drain, to forced worker termination.
 enum class ShutdownState : std::uint8_t { Running, Draining, Stopping };
 std::atomic<ShutdownState> g_shutdown_state{ShutdownState::Running};
 std::atomic<std::int64_t> g_drain_deadline_ns{0};
 
+// Chooses a conservative default worker count from available CPU concurrency.
 std::size_t default_event_loop_count() {
     const unsigned int hardware_threads = std::thread::hardware_concurrency();
     return hardware_threads == 0 ? 1U : hardware_threads;
 }
 
+// Parses a base-10 CLI value; text is the raw input and arg_name labels errors.
 int parse_int_arg(const char* text, const char* arg_name) {
     try {
         std::size_t pos = 0;
@@ -83,6 +87,8 @@ int parse_int_arg(const char* text, const char* arg_name) {
     }
 }
 
+// Move-only RAII owner for a Linux file descriptor; it closes the descriptor
+// when reset, replaced, or destroyed.
 class UniqueFd {
 public:
     UniqueFd() noexcept = default;
@@ -143,6 +149,8 @@ private:
     int fd_ = -1;
 };
 
+// Blocks termination signals for the process and exposes them through a
+// nonblocking signalfd that the coordinator can poll safely.
 class SignalFd {
 public:
     SignalFd() {
@@ -171,11 +179,14 @@ private:
     UniqueFd fd_;
 };
 
+// Returns the monotonic clock in nanoseconds for lock-free shutdown deadlines.
 std::int64_t steady_clock_ns() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Advances global shutdown state on each termination signal: the first starts
+// draining and a later signal requests immediate stopping.
 void begin_graceful_shutdown() noexcept {
     ShutdownState expected = ShutdownState::Running;
     if (g_shutdown_state.compare_exchange_strong(expected, ShutdownState::Draining,
@@ -188,6 +199,8 @@ void begin_graceful_shutdown() noexcept {
     }
 }
 
+// Reports whether error_code indicates temporary descriptor or memory pressure
+// for which accepting should pause rather than terminate the server.
 bool is_resource_exhaustion_error(int error_code) {
     switch (error_code) {
     case EMFILE:
@@ -202,10 +215,12 @@ bool is_resource_exhaustion_error(int error_code) {
 
 } // namespace
 
+// Owns a generated response payload associated with one request key.
 struct ClientResponse {
     std::vector<std::uint8_t> payload;
 };
 
+// Hashes string-like request keys without allocating a temporary std::string.
 struct TransparentStringHash {
     using is_transparent = void;
 
@@ -222,6 +237,7 @@ struct TransparentStringHash {
     }
 };
 
+// Enables heterogeneous equality checks for owned and borrowed request keys.
 struct TransparentStringEqual {
     using is_transparent = void;
 
@@ -232,12 +248,16 @@ struct TransparentStringEqual {
 
 using RequestMap = std::unordered_map<std::string, ClientResponse, TransparentStringHash, TransparentStringEqual>;
 
+// Selects whether mapping payloads are read into memory or referenced directly
+// from a memory-mapped file.
 enum class MappingLoadMode {
     Ifstream,
     MMap,
     MMapView
 };
 
+// Non-owning byte range returned by a mapping lookup; the mapping store keeps
+// the referenced payload alive for the server lifetime.
 struct ResponseBufferView {
     const std::uint8_t* data = nullptr;
     std::size_t size = 0;
@@ -255,11 +275,14 @@ namespace {
 constexpr std::size_t kDefaultMappingEntries = 500000;
 }
 
+// Formats the configured response payload bounds for diagnostics.
 std::string payload_range_string() {
     return "[" + std::to_string(tcp_common::kMinPayloadSize) + ", " +
            std::to_string(tcp_common::kMaxPayloadSize) + "]";
 }
 
+// Generates count unique request keys and random payloads within protocol size
+// limits for creating a benchmark mapping file.
 RequestMap generate_random_requests(std::size_t count) {
     static_assert(tcp_common::kMinPayloadSize >= sizeof(std::uint64_t),
                   "payload must have room for its unique response ID");
@@ -318,6 +341,7 @@ RequestMap generate_random_requests(std::size_t count) {
     return data;
 }
 
+// Writes exactly size bytes from data to fd, retrying interrupted/partial I/O.
 void write_all_fd(int fd, const void* data, std::size_t size) {
     const auto* bytes = static_cast<const std::uint8_t*>(data);
     std::size_t written = 0;
@@ -336,6 +360,7 @@ void write_all_fd(int fd, const void* data, std::size_t size) {
     }
 }
 
+// Serializes value to fd as one big-endian 32-bit mapping-file field.
 void write_u32_fd(int fd, std::uint32_t value) {
     // MAP1 integers are always little-endian, independent of host CPU endian.
     const std::array<std::uint8_t, 4> bytes{
@@ -346,6 +371,8 @@ void write_u32_fd(int fd, std::uint32_t value) {
     write_all_fd(fd, bytes.data(), bytes.size());
 }
 
+// Reads exactly size bytes from fd into data; context identifies the field in
+// truncation and I/O errors.
 void read_exact_fd(int fd, void* data, std::size_t size, const char* context) {
     auto* bytes = static_cast<std::uint8_t*>(data);
     std::size_t total = 0;
@@ -365,6 +392,7 @@ void read_exact_fd(int fd, void* data, std::size_t size, const char* context) {
     }
 }
 
+// Reads and converts one big-endian 32-bit field from fd; context labels errors.
 std::uint32_t read_u32_fd(int fd, const char* context) {
     std::array<std::uint8_t, 4> bytes{};
     read_exact_fd(fd, bytes.data(), bytes.size(), context);
@@ -374,6 +402,7 @@ std::uint32_t read_u32_fd(int fd, const char* context) {
            (static_cast<std::uint32_t>(bytes[3]) << 24U);
 }
 
+// Validates the mapping file's magic identifier and supported format version.
 void validate_mapping_file_header(std::uint32_t magic, std::uint32_t version) {
     if (magic != tcp_common::kMappingFileMagic) {
         throw std::runtime_error("invalid mapping file magic; expected MAP1 format");
@@ -383,6 +412,7 @@ void validate_mapping_file_header(std::uint32_t magic, std::uint32_t version) {
     }
 }
 
+// Ensures file_size for path fits the minimum header and configured safety cap.
 void validate_mapping_file_size(std::size_t file_size, const std::string& path) {
     if (file_size < tcp_common::kMappingFileHeaderBytes) {
         throw std::runtime_error("mapping file is too small to contain required header: " + path);
@@ -393,6 +423,8 @@ void validate_mapping_file_size(std::size_t file_size, const std::string& path) 
     }
 }
 
+// Reads one big-endian integer at cursor, advances it, and uses end to reject
+// truncated memory-mapped input.
 std::uint32_t read_u32_from_memory(const std::uint8_t*& cursor, const std::uint8_t* end) {
     if (static_cast<std::size_t>(end - cursor) < sizeof(std::uint32_t)) {
         throw std::runtime_error("mapping file is truncated while reading u32");
@@ -406,6 +438,7 @@ std::uint32_t read_u32_from_memory(const std::uint8_t*& cursor, const std::uint8
     return value;
 }
 
+// Narrows value for the on-disk format and uses field to describe overflow.
 std::uint32_t checked_u32(std::size_t value, const char* field) {
     if (value > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error(std::string(field) + " exceeds MAP1 u32 limit");
@@ -413,6 +446,8 @@ std::uint32_t checked_u32(std::size_t value, const char* field) {
     return static_cast<std::uint32_t>(value);
 }
 
+// Persists data to path using the versioned binary format and an atomic file
+// replacement so readers never observe a partial mapping.
 void save_mapping_file(const std::string& path, const RequestMap& data) {
     std::string tmp_template = path + ".tmp.XXXXXX";
     std::vector<char> tmp_buffer(tmp_template.begin(), tmp_template.end());
@@ -533,6 +568,8 @@ void save_request_keys_file(const std::string& path,
     }
 }
 
+// Opens path read-only and holds a shared advisory lock while its mapping is
+// inspected or loaded.
 UniqueFd open_locked_mapping_file(const std::string& path) {
     UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
     if (!fd) {
@@ -546,6 +583,8 @@ UniqueFd open_locked_mapping_file(const std::string& path) {
     return fd;
 }
 
+// Validates and loads the mapping at path through descriptor reads into owned
+// request and response buffers.
 RequestMap load_mapping_file(const std::string& path) {
     // Open -> lock -> fstat removes the size-check TOCTOU window for this loader.
     UniqueFd mapping_fd = open_locked_mapping_file(path);
@@ -630,6 +669,7 @@ RequestMap load_mapping_file(const std::string& path) {
     return data;
 }
 
+// Owns a read-only mmap of length bytes from fd and releases it on destruction.
 class MappedRegion {
 public:
     MappedRegion(int fd, std::size_t length) : length_(length) {
@@ -661,19 +701,25 @@ private:
     std::size_t length_ = 0;
 };
 
+// Keeps an mmap alive alongside an index whose keys and payloads borrow bytes
+// directly from that mapped region.
 struct MMapViewLoadedData {
     std::unique_ptr<MappedRegion> region;
     MappedRequestMap data;
 };
 
+// Provides one lookup interface over either fully owned mappings or zero-copy
+// mmap-backed views, and owns whichever backing storage is active.
 class MappingStore {
 public:
+    // Replaces current storage with an owned request map supplied in data.
     void set_owned(RequestMap&& data) {
         mapped_view_data_.clear();
         mapped_region_.reset();
         owned_data_ = std::move(data);
     }
 
+    // Replaces current storage with loaded's mmap-backed region and index.
     void set_mmap_view(MMapViewLoadedData&& loaded) {
         owned_data_.clear();
         owned_data_.rehash(0);
@@ -681,6 +727,7 @@ public:
         mapped_view_data_ = std::move(loaded.data);
     }
 
+    // Returns the entry count for the active owned or mmap-backed representation.
     std::size_t size() const {
         if (mapped_region_ != nullptr) {
             return mapped_view_data_.size();
@@ -688,6 +735,7 @@ public:
         return owned_data_.size();
     }
 
+    // Finds request without allocation and returns its payload byte range.
     std::optional<ResponseBufferView> find(std::string_view request) const {
         if (mapped_region_ != nullptr) {
             auto it = mapped_view_data_.find(request);
@@ -704,6 +752,7 @@ public:
         return ResponseBufferView{it->second.payload.data(), it->second.payload.size()};
     }
 
+    // Writes at most max_keys sorted request keys to output_path for clients.
     void export_request_keys(std::size_t max_keys,
                              const std::string& output_path) const {
         const std::size_t limit = std::min(max_keys, size());
@@ -743,18 +792,23 @@ private:
 
 MappingStore g_mapping_store;
 
+// Installs data as the process-wide owned mapping after validation/loading.
 void set_owned_mapping_data(RequestMap&& data) {
     g_mapping_store.set_owned(std::move(data));
 }
 
+// Installs loaded's zero-copy index and mapped backing region globally.
 void set_mmap_view_mapping_data(MMapViewLoadedData&& loaded) {
     g_mapping_store.set_mmap_view(std::move(loaded));
 }
 
+// Returns the number of request/response entries in the active mapping store.
 std::size_t request_mapping_size() {
     return g_mapping_store.size();
 }
 
+// Parses path through mmap but copies keys and payloads into an owned RequestMap
+// before releasing the mapped file.
 RequestMap load_mapping_file_mmap(const std::string& path) {
     UniqueFd fd = open_locked_mapping_file(path);
 
@@ -827,6 +881,8 @@ RequestMap load_mapping_file_mmap(const std::string& path) {
     return data;
 }
 
+// Maps path and builds a zero-copy index of string and payload views whose
+// lifetime is tied to the returned MMapViewLoadedData.
 MMapViewLoadedData load_mapping_file_mmap_view(const std::string& path) {
     UniqueFd fd = open_locked_mapping_file(path);
 
@@ -896,6 +952,8 @@ MMapViewLoadedData load_mapping_file_mmap_view(const std::string& path) {
     return MMapViewLoadedData{std::move(region), std::move(data)};
 }
 
+// Generates or loads path according to force_regenerate and load_mode;
+// mapping_entries controls the generated entry count when regeneration is set.
 void initialize_request_mapping(const std::string& path,
                                 bool force_regenerate,
                                 MappingLoadMode load_mode,
@@ -955,14 +1013,18 @@ void initialize_request_mapping(const std::string& path,
               << " using ifstream" << std::endl;
 }
 
+// Exports up to max_keys from the active mapping to newline-delimited output_path.
 void print_request_keys(std::size_t max_keys, const std::string& output_path) {
     g_mapping_store.export_request_keys(max_keys, output_path);
 }
 
+// Looks up request in the active store and returns a non-owning payload view.
 std::optional<ResponseBufferView> find_client_response(std::string_view request) {
     return g_mapping_store.find(request);
 }
 
+// Holds all per-client state needed for edge-triggered request parsing, partial
+// response writes, and generation-safe idle timeout tracking.
 struct ConnectionState {
     explicit ConnectionState(UniqueFd socket_value)
         : socket(std::move(socket_value)) {
@@ -981,9 +1043,12 @@ struct ConnectionState {
     bool response_ready = false;
 };
 
+// Owns live connections in slots indexed by descriptor, enabling constant-time
+// lookup while rejecting stale references through descriptor checks.
 class ConnectionTable {
 public:
     using Iterator = std::unordered_map<int, ConnectionState>::iterator;
+    // Takes ownership of socket and creates its state in the descriptor slot.
     ConnectionState& emplace(UniqueFd socket) {
         const int fd = socket.get();
         if (fd < 0) {
@@ -996,6 +1061,7 @@ public:
         return it->second;
     }
 
+    // Returns mutable state for fd, or nullptr when its slot is empty/stale.
     ConnectionState* find(int fd) noexcept {
         if (fd < 0) {
             return nullptr;
@@ -1005,6 +1071,7 @@ public:
         return it == entries_.end() ? nullptr : &it->second;
     }
 
+    // Returns read-only state for fd, or nullptr when its slot is empty/stale.
     const ConnectionState* find(int fd) const noexcept {
         if (fd < 0) {
             return nullptr;
@@ -1014,6 +1081,7 @@ public:
         return it == entries_.end() ? nullptr : &it->second;
     }
 
+    // Releases the connection stored for fd if the descriptor still matches.
     void erase(int fd) noexcept {
         entries_.erase(fd);
     }
@@ -1038,6 +1106,8 @@ private:
     std::unordered_map<int, ConnectionState> entries_;
 };
 
+// Priority-queue record for one connection idle deadline; generation prevents
+// an older record from expiring a connection that has since received activity.
 struct DeadlineEntry {
     std::chrono::steady_clock::time_point deadline;
     int fd = -1;
@@ -1048,6 +1118,7 @@ struct DeadlineEntry {
     }
 };
 
+// Creates the close-on-exec epoll descriptor used by one event-loop worker.
 UniqueFd create_epoll_handle() {
     const int epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
@@ -1056,6 +1127,7 @@ UniqueFd create_epoll_handle() {
     return UniqueFd(epoll_fd);
 }
 
+// Creates a nonblocking eventfd used for wakeups or worker completion signals.
 UniqueFd create_event_handle() {
     const int event_fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (event_fd < 0) {
@@ -1064,6 +1136,8 @@ UniqueFd create_event_handle() {
     return UniqueFd(event_fd);
 }
 
+// Acquires a process-level advisory lock keyed by listen_port so two benchmark
+// instances cannot unintentionally serve different mappings on the same port.
 UniqueFd acquire_port_instance_lock(int listen_port) {
     const std::string lock_path =
         "/tmp/tcp_server_epoll." + std::to_string(static_cast<unsigned long>(::getuid())) +
@@ -1088,6 +1162,8 @@ UniqueFd acquire_port_instance_lock(int listen_port) {
     return lock_fd;
 }
 
+// Creates, configures, binds, and listens on a nonblocking IPv4 socket for
+// listen_port; SO_REUSEPORT permits one listener per event-loop worker.
 UniqueFd create_reuseport_listener(int listen_port) {
     const int listen_fd =
         ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
@@ -1133,8 +1209,12 @@ UniqueFd create_reuseport_listener(int listen_port) {
     return listen_socket;
 }
 
+// Linux-specific implementation of one isolated epoll worker, including its
+// listener, wake channel, connection table, and idle-deadline queue.
 class EventLoop::Impl {
 public:
+    // Builds worker loop_id with a reuse-port listener on listen_port, the
+    // requested idle_timeout, and a hard max_connections capacity.
     Impl(std::size_t loop_id,
          int listen_port,
          std::chrono::seconds idle_timeout,
@@ -1161,6 +1241,7 @@ public:
         remove_fd(wake_fd_.fd());
     }
 
+    // Dispatches epoll events until stop_token or global shutdown completes.
     void run(std::stop_token stop_token) {
         std::vector<epoll_event> events(kMaxEpollEvents);
 
@@ -1201,6 +1282,7 @@ public:
         }
     }
 
+    // Signals the worker's eventfd so a blocked epoll_wait returns promptly.
     void wake() noexcept {
         const std::uint64_t one = 1;
         for (;;) {
@@ -1223,6 +1305,7 @@ public:
     }
 
 private:
+    // Adds fd to this worker's epoll set with the requested event mask.
     void register_fd(int fd, std::uint32_t events) {
         epoll_event ev{};
         ev.events = events;
@@ -1232,6 +1315,7 @@ private:
         }
     }
 
+    // Adds client fd with events, logging and returning false on failure.
     bool try_register_connection_fd(int fd, std::uint32_t events) noexcept {
         epoll_event ev{};
         ev.events = events;
@@ -1245,6 +1329,7 @@ private:
         return false;
     }
 
+    // Replaces fd's epoll interest mask with events, returning success status.
     bool try_modify_fd(int fd, std::uint32_t events) noexcept {
         epoll_event ev{};
         ev.events = events;
@@ -1258,10 +1343,12 @@ private:
         return false;
     }
 
+    // Best-effort removal of fd from this worker's epoll set.
     void remove_fd(int fd) noexcept {
         ::epoll_ctl(epoll_fd_.fd(), EPOLL_CTL_DEL, fd, nullptr);
     }
 
+    // Consumes accumulated eventfd notifications after a wake event.
     void drain_wake_fd() noexcept {
         std::uint64_t value = 0;
         for (;;) {
@@ -1276,6 +1363,8 @@ private:
         }
     }
 
+    // Temporarily removes the listener from epoll for duration after capacity
+    // or resource pressure.
     void pause_accepting(std::chrono::milliseconds duration) noexcept {
         if (listen_socket_.fd() < 0) {
             return;
@@ -1288,6 +1377,7 @@ private:
         accept_resume_time_ = std::max(accept_resume_time_, requested_deadline);
     }
 
+    // Re-registers the listener after its backoff deadline, if still running.
     void maybe_resume_accepting() {
         if (listen_socket_.fd() < 0 || listener_registered_ ||
             std::chrono::steady_clock::now() < accept_resume_time_) {
@@ -1297,6 +1387,7 @@ private:
         listener_registered_ = true;
     }
 
+    // Permanently closes this worker's listener during shutdown.
     void stop_accepting() noexcept {
         if (listen_socket_.fd() < 0) {
             return;
@@ -1308,6 +1399,7 @@ private:
         listen_socket_.reset();
     }
 
+    // Opens the emergency descriptor reserved for recovery from EMFILE.
     static UniqueFd open_reserve_fd() {
         const int fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
@@ -1316,6 +1408,8 @@ private:
         return UniqueFd(fd);
     }
 
+    // Frees the reserve descriptor, accepts and rejects one queued client, then
+    // restores the reserve so future descriptor exhaustion remains recoverable.
     void recover_from_emfile() noexcept {
         reserve_fd_.reset();
         sockaddr_in client_addr{};
@@ -1335,6 +1429,7 @@ private:
         }
     }
 
+    // Refreshes connection's idle deadline and publishes a new generation entry.
     void touch(ConnectionState& connection) {
         connection.deadline = std::chrono::steady_clock::now() + idle_timeout_;
         ++connection.generation;
@@ -1342,6 +1437,7 @@ private:
         compact_deadlines_if_needed();
     }
 
+    // Rebuilds the deadline queue when stale generations grow disproportionately.
     void compact_deadlines_if_needed() {
         constexpr std::size_t kDeadlineSlack = 256;
         const std::size_t max_entries = connections_.size() * 2 + kDeadlineSlack;
@@ -1356,6 +1452,7 @@ private:
         deadlines_.swap(compacted);
     }
 
+    // Routes one epoll event to wake, accept, read, write, error, or hangup logic.
     void handle_event(const epoll_event& event) {
         if (event.data.fd == wake_fd_.fd()) {
             drain_wake_fd();
@@ -1415,6 +1512,8 @@ private:
         }
     }
 
+    // Accepts a bounded batch from the ready listener, registers each client,
+    // and applies backpressure at resource or connection limits.
     void accept_ready_connections() {
         if (connections_.size() >= max_connections_) {
             pause_accepting(kAcceptCapacityBackoff);
@@ -1500,6 +1599,8 @@ private:
         }
     }
 
+    // Reads a newline-terminated key into connection, resolves its response, and
+    // switches epoll interest to writes; false means the client must close.
     bool handle_read(ConnectionState& connection) {
         std::array<char, 512> buffer{};
         std::size_t bytes_read = 0;
@@ -1573,6 +1674,8 @@ private:
         return true;
     }
 
+    // Sends a bounded chunk of connection's response; returns true only while
+    // the connection should remain registered for more output.
     bool handle_write(ConnectionState& connection) {
         std::size_t bytes_written = 0;
         while (connection.response_sent < connection.response_size &&
@@ -1604,6 +1707,7 @@ private:
         return connection.response_sent < connection.response_size;
     }
 
+    // Closes connections whose current-generation idle deadline has elapsed.
     void expire_idle_connections() {
         const auto now = std::chrono::steady_clock::now();
         while (!deadlines_.empty() && deadlines_.top().deadline <= now) {
@@ -1625,6 +1729,7 @@ private:
         }
     }
 
+    // Removes fd from epoll and releases its state, updating close statistics.
     void close_connection(int fd) noexcept {
         ConnectionState* connection = connections_.find(fd);
         if (connection == nullptr) {
@@ -1636,6 +1741,7 @@ private:
         ++stats_.closed;
     }
 
+    // Removes and releases every client owned by this worker during teardown.
     void shutdown_all_connections() noexcept {
         for (auto it = connections_.begin(); it != connections_.end();) {
             const int fd = it->first;
@@ -1662,6 +1768,8 @@ private:
                         std::greater<DeadlineEntry>> deadlines_;
 };
 
+// Constructs the public worker facade from its identifier, shared port,
+// per-connection idle timeout, and per-worker connection limit.
 EventLoop::EventLoop(std::size_t loop_id,
                      int listen_port,
                      std::chrono::seconds idle_timeout,
@@ -1670,18 +1778,23 @@ EventLoop::EventLoop(std::size_t loop_id,
 
 EventLoop::~EventLoop() noexcept = default;
 
+// Delegates event processing to the implementation until stop_token is set.
 void EventLoop::run(std::stop_token stop_token) {
     impl_->run(stop_token);
 }
 
+// Delegates a thread-safe wake notification to the implementation.
 void EventLoop::wake() noexcept {
     impl_->wake();
 }
 
+// Returns a snapshot of this worker's lifecycle counters.
 EventLoopStats EventLoop::stats() const noexcept {
     return impl_->stats();
 }
 
+// Coordinates event_loop_count workers on listen_port, applying idle_timeout
+// and max_connections_per_loop; port_instance_lock is retained for exclusivity.
 void start_listen(int listen_port,
                   std::size_t event_loop_count,
                   std::chrono::seconds idle_timeout,
@@ -1886,6 +1999,8 @@ void start_listen(int listen_port,
               << " closed=" << totals.closed << std::endl;
 }
 
+// Parses server and mapping options, initializes the shared request mapping,
+// optionally exports keys, and starts listeners. argc/argv are the CLI inputs.
 int main(int argc, char* argv[]) {
     try {
         int listen_port = 0;

@@ -38,6 +38,8 @@ constexpr auto kClientIoTimeout = std::chrono::seconds(5);
 constexpr std::size_t kDefaultMaxConcurrency = 128;
 constexpr std::size_t kMaxPrintedErrorsPerRound = 10;
 
+// Parses a base-10 command-line value; text is the raw value and arg_name is
+// used to identify the option in validation errors.
 int parse_int_arg(const char* text, const char* arg_name) {
     try {
         std::size_t pos = 0;
@@ -52,11 +54,15 @@ int parse_int_arg(const char* text, const char* arg_name) {
     }
 }
 
+// Distinguishes failures to establish a connection from later request I/O
+// failures so benchmark summaries can report them separately.
 class ConnectError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
 
+// Move-only RAII owner for a socket file descriptor; construction accepts an
+// already-open descriptor and destruction closes it.
 class Socket {
 public:
     Socket() = default;
@@ -102,11 +108,15 @@ private:
     int fd_ = -1;
 };
 
+// Runs one request/response exchange against a configured IPv4 server.
+// server_ip and server_port identify the endpoint used by connect_to_server().
 class TcpClient {
 public:
     TcpClient(std::string server_ip, std::uint16_t server_port)
         : server_ip_(std::move(server_ip)), server_port_(server_port) {}
 
+    // Opens the configured endpoint with a bounded nonblocking connect, then
+    // switches to blocking I/O with send and receive timeouts.
     void connect_to_server() {
         const int fd = ::socket(AF_INET,
                                 SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
@@ -143,6 +153,7 @@ public:
         set_socket_io_timeout(socket_.get(), kClientIoTimeout);
     }
 
+    // Sends request as the protocol's newline-terminated request key.
     void send_request(std::string_view request) {
         std::string framed_request(request);
         if (framed_request.empty() || framed_request.back() != '\n') {
@@ -153,12 +164,16 @@ public:
                  framed_request.size());
     }
 
+    // Half-closes the connected socket to tell the server no more request
+    // bytes will follow while leaving the read side open for the response.
     void shutdown_write() {
         if (socket_.valid() && ::shutdown(socket_.get(), SHUT_WR) < 0) {
             throw std::runtime_error(std::string("shutdown(SHUT_WR) failed: ") + std::strerror(errno));
         }
     }
 
+    // Reads response bytes until the server closes its write side and returns
+    // the complete binary payload.
     std::vector<std::uint8_t> receive_response() {
         std::vector<std::uint8_t> response;
         std::vector<std::uint8_t> buffer(1024);
@@ -182,10 +197,13 @@ public:
     }
 
 private:
+    // Formats the configured address for diagnostics.
     [[nodiscard]] std::string endpoint() const {
         return server_ip_ + ":" + std::to_string(server_port_);
     }
 
+    // Converts a socket error_code into an endpoint-specific ConnectError and
+    // closes the unusable socket before throwing.
     [[noreturn]] void throw_connect_error(int error_code) {
         socket_.reset();
         std::string reason;
@@ -213,6 +231,8 @@ private:
         throw ConnectError("cannot connect to TCP server " + endpoint() + ": " + reason);
     }
 
+    // Waits for a nonblocking connect to finish and validates SO_ERROR before
+    // the shared client I/O timeout expires.
     void wait_for_connection() {
         const auto deadline = std::chrono::steady_clock::now() + kClientIoTimeout;
         pollfd descriptor{socket_.get(), POLLOUT, 0};
@@ -254,6 +274,7 @@ private:
         }
     }
 
+    // Applies timeout to both receive and send operations on fd.
     void set_socket_io_timeout(int fd, std::chrono::seconds timeout) {
         timeval socket_timeout{};
         socket_timeout.tv_sec = static_cast<decltype(socket_timeout.tv_sec)>(timeout.count());
@@ -268,6 +289,8 @@ private:
         }
     }
 
+    // Sends exactly size bytes beginning at data, retrying interrupted and
+    // partial writes.
     void send_all(const std::uint8_t* data, std::size_t size) {
         std::size_t sent = 0;
         while (sent < size) {
@@ -290,6 +313,8 @@ private:
     Socket socket_;
 };
 
+// Converts binary response data into a review-friendly, 16-byte-per-line hex
+// dump for verbose benchmark output.
 std::string render_hex_dump(const std::vector<std::uint8_t>& data) {
     std::ostringstream out;
     out << std::hex << std::setfill('0');
@@ -309,11 +334,14 @@ std::string render_hex_dump(const std::vector<std::uint8_t>& data) {
 
 constexpr std::size_t kDefaultRequestCount = 8;
 
+// Formats the shared minimum and maximum payload sizes for error messages.
 std::string payload_range_string() {
     return "[" + std::to_string(tcp_common::kMinPayloadSize) + ", " +
            std::to_string(tcp_common::kMaxPayloadSize) + "]";
 }
 
+// Loads and validates newline-delimited request keys from keys_file, enforcing
+// the protocol's file, entry-count, and key-length limits.
 std::vector<std::string> load_request_keys(const std::string& keys_file) {
     std::error_code file_size_error;
     const std::uintmax_t file_size = std::filesystem::file_size(keys_file, file_size_error);
@@ -361,6 +389,8 @@ std::vector<std::string> load_request_keys(const std::string& keys_file) {
     return requests;
 }
 
+// Selects request_count keys uniformly with replacement from all_requests for
+// one benchmark round.
 std::vector<std::string> pick_random_requests(const std::vector<std::string>& all_requests,
                                               std::size_t request_count) {
     if (all_requests.empty()) {
@@ -383,6 +413,8 @@ std::vector<std::string> pick_random_requests(const std::vector<std::string>& al
 
 } // namespace
 
+// Captures one request's verbose output and outcome; populated only when
+// detailed per-request reporting is enabled.
 struct RequestResult {
     std::string request;
     std::string output;
@@ -391,6 +423,8 @@ struct RequestResult {
     std::size_t response_bytes = 0;
 };
 
+// Parses benchmark options, loads request keys, and runs bounded-concurrency
+// request rounds. argc/argv contain the server endpoint and optional controls.
 int main(int argc, char* argv[]) {
     try {
         if (argc < 3) {
