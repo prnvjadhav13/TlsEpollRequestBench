@@ -21,6 +21,10 @@
 #include <chrono>
 #include <limits>
 #include <atomic>
+#include <condition_variable>
+#include <csignal>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <filesystem>
 
@@ -35,8 +39,46 @@
 namespace {
 
 constexpr auto kClientIoTimeout = std::chrono::seconds(5);
-constexpr std::size_t kDefaultMaxConcurrency = 128;
 constexpr std::size_t kMaxPrintedErrorsPerRound = 10;
+constexpr std::size_t kMaxConcurrency = 4096;
+constexpr std::size_t kMaxRequestsPerRound = 10'000'000;
+constexpr std::size_t kMaxQueueCapacity = 1'000'000;
+constexpr int kMaxRoundDelayMs = 3'600'000;
+
+volatile std::sig_atomic_t g_stop_requested = 0;
+volatile std::sig_atomic_t g_signal_count = 0;
+
+extern "C" void termination_signal_handler(int signal_number) {
+    if (g_signal_count == 0) {
+        g_signal_count = 1;
+        g_stop_requested = signal_number;
+        return;
+    }
+
+    // A second signal requests immediate termination. _exit is async-signal-safe.
+    ::_exit(128 + signal_number);
+}
+
+void install_termination_signal_handlers() {
+    struct sigaction action {};
+    action.sa_handler = termination_signal_handler;
+    ::sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    if (::sigaction(SIGINT, &action, nullptr) < 0 ||
+        ::sigaction(SIGTERM, &action, nullptr) < 0) {
+        throw std::runtime_error(std::string("sigaction failed: ") + std::strerror(errno));
+    }
+}
+
+// Uses the number of CPUs made available to this process as the conservative
+// default concurrency. One blocking-I/O worker per CPU avoids the severe
+// oversubscription caused by a fixed default on small machines. Callers can
+// still raise --max-concurrency after measuring their network workload.
+[[nodiscard]] std::size_t default_max_concurrency() noexcept {
+    const unsigned int reported = std::thread::hardware_concurrency();
+    const std::size_t available_cpus = reported == 0 ? 1 : reported;
+    return std::min(available_cpus, kMaxConcurrency);
+}
 
 // Parses a base-10 command-line value; text is the raw value and arg_name is
 // used to identify the option in validation errors.
@@ -188,6 +230,13 @@ public:
             }
             if (n == 0) {
                 break;
+            }
+
+            const auto received = static_cast<std::size_t>(n);
+            if (received > tcp_common::kMaxPayloadSize - response.size()) {
+                throw std::runtime_error(
+                    "response exceeds maximum supported size " +
+                    std::to_string(tcp_common::kMaxPayloadSize));
             }
 
             response.insert(response.end(), buffer.begin(), buffer.begin() + n);
@@ -392,7 +441,8 @@ std::vector<std::string> load_request_keys(const std::string& keys_file) {
 // Selects request_count keys uniformly with replacement from all_requests for
 // one benchmark round.
 std::vector<std::string> pick_random_requests(const std::vector<std::string>& all_requests,
-                                              std::size_t request_count) {
+                                              std::size_t request_count,
+                                              std::mt19937& rng) {
     if (all_requests.empty()) {
         throw std::runtime_error("no requests available for random selection");
     }
@@ -400,8 +450,6 @@ std::vector<std::string> pick_random_requests(const std::vector<std::string>& al
     std::vector<std::string> selected;
     selected.reserve(request_count);
 
-    std::random_device rd;
-    std::mt19937 rng(rd());
     std::uniform_int_distribution<std::size_t> idx_dist(0, all_requests.size() - 1);
 
     for (std::size_t i = 0; i < request_count; ++i) {
@@ -423,13 +471,247 @@ struct RequestResult {
     std::size_t response_bytes = 0;
 };
 
+// Owns all data and counters for one reporting round. Jobs keep this object
+// alive while they are queued or executing in the persistent worker pool.
+struct RoundState {
+    RoundState(std::vector<std::string> selected_requests, bool verbose)
+        : requests(std::move(selected_requests)),
+          verbose_output(verbose),
+          remaining(requests.size()) {
+        if (verbose_output) {
+            results.resize(requests.size());
+        }
+        sample_errors.reserve(kMaxPrintedErrorsPerRound);
+    }
+
+    void record_error(std::string message) {
+        std::lock_guard<std::mutex> lock(sample_errors_mutex);
+        if (sample_errors.size() < kMaxPrintedErrorsPerRound) {
+            sample_errors.push_back(std::move(message));
+        }
+    }
+
+    void complete_one() noexcept {
+        std::lock_guard<std::mutex> lock(completion_mutex);
+        if (remaining > 0) {
+            --remaining;
+        }
+        if (remaining == 0) {
+            completion_cv.notify_all();
+        }
+    }
+
+    [[nodiscard]] bool wait_until_complete_or_stopped() {
+        std::unique_lock<std::mutex> lock(completion_mutex);
+        while (remaining != 0 && g_stop_requested == 0) {
+            completion_cv.wait_for(lock, std::chrono::milliseconds(50));
+        }
+        return remaining == 0;
+    }
+
+    std::vector<std::string> requests;
+    bool verbose_output = false;
+    std::vector<RequestResult> results;
+    std::atomic<std::size_t> success_count{0};
+    std::atomic<std::size_t> connect_failed_count{0};
+    std::atomic<std::size_t> failed_count{0};
+    std::atomic<std::size_t> bytes_received_total{0};
+    std::vector<std::string> sample_errors;
+    std::mutex sample_errors_mutex;
+
+private:
+    std::mutex completion_mutex;
+    std::condition_variable completion_cv;
+    std::size_t remaining;
+};
+
+struct RequestJob {
+    std::shared_ptr<RoundState> round;
+    std::size_t index = 0;
+};
+
+// Fixed-size worker pool with a bounded FIFO. Threads are created once and
+// sleep on condition variables when no work is available.
+class BoundedWorkerPool {
+public:
+    BoundedWorkerPool(std::size_t worker_count,
+                      std::size_t queue_capacity,
+                      std::string server_ip,
+                      std::uint16_t server_port)
+        : queue_capacity_(queue_capacity),
+          server_ip_(std::move(server_ip)),
+          server_port_(server_port) {
+        workers_.reserve(worker_count);
+        try {
+            for (std::size_t i = 0; i < worker_count; ++i) {
+                workers_.emplace_back([this] { worker_loop(); });
+            }
+        } catch (...) {
+            request_stop();
+            join();
+            throw;
+        }
+    }
+
+    ~BoundedWorkerPool() {
+        request_stop();
+        join();
+    }
+
+    BoundedWorkerPool(const BoundedWorkerPool&) = delete;
+    BoundedWorkerPool& operator=(const BoundedWorkerPool&) = delete;
+
+    [[nodiscard]] bool submit(RequestJob job) {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_not_full_.wait(lock, [this] {
+            return stopping_ || g_stop_requested != 0 || queue_.size() < queue_capacity_;
+        });
+        if (stopping_ || g_stop_requested != 0) {
+            return false;
+        }
+        queue_.push_back(std::move(job));
+        queue_not_empty_.notify_one();
+        return true;
+    }
+
+    // Discards queued work. Active requests finish under their socket timeout.
+    void request_stop() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (stopping_) {
+                return;
+            }
+            stopping_ = true;
+            queue_.clear();
+        }
+        queue_not_empty_.notify_all();
+        queue_not_full_.notify_all();
+    }
+
+    void join() noexcept {
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+private:
+    void worker_loop() noexcept {
+        for (;;) {
+            RequestJob job;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                queue_not_empty_.wait(lock, [this] {
+                    return stopping_ || !queue_.empty();
+                });
+                if (stopping_ && queue_.empty()) {
+                    return;
+                }
+                job = std::move(queue_.front());
+                queue_.pop_front();
+                queue_not_full_.notify_one();
+            }
+
+            process(job);
+            job.round->complete_one();
+        }
+    }
+
+    void process(const RequestJob& job) noexcept {
+        RoundState& round = *job.round;
+        const std::size_t i = job.index;
+        try {
+            if (round.verbose_output) {
+                round.results[i].request = round.requests[i];
+            }
+
+            TcpClient client(server_ip_, server_port_);
+            client.connect_to_server();
+            client.send_request(round.requests[i]);
+            client.shutdown_write();
+
+            std::vector<std::uint8_t> response = client.receive_response();
+            if (response.size() < tcp_common::kMinPayloadSize) {
+                throw std::runtime_error(
+                    "response size " + std::to_string(response.size()) +
+                    " is outside expected range " + payload_range_string());
+            }
+            round.bytes_received_total.fetch_add(response.size(), std::memory_order_relaxed);
+            round.success_count.fetch_add(1, std::memory_order_relaxed);
+
+            if (round.verbose_output) {
+                std::ostringstream out;
+                out << "Request: " << round.requests[i] << '\n';
+                out << "Received " << response.size() << " byte(s) from server\n";
+                out << render_hex_dump(response);
+                round.results[i].output = out.str();
+                round.results[i].connect_failed = false;
+                round.results[i].success = true;
+                round.results[i].response_bytes = response.size();
+            }
+        } catch (const ConnectError& error) {
+            round.connect_failed_count.fetch_add(1, std::memory_order_relaxed);
+            round.failed_count.fetch_add(1, std::memory_order_relaxed);
+            record_failure(round, i, error.what(), true);
+        } catch (const std::exception& error) {
+            round.failed_count.fetch_add(1, std::memory_order_relaxed);
+            record_failure(round, i, error.what(), false);
+        } catch (...) {
+            round.failed_count.fetch_add(1, std::memory_order_relaxed);
+            record_failure(round, i, "unknown non-standard exception", false);
+        }
+    }
+
+    static void record_failure(RoundState& round,
+                               std::size_t index,
+                               const std::string& reason,
+                               bool connect_failed) noexcept {
+        try {
+            const std::string error_line =
+                "Request: " + round.requests[index] + "\nError: " + reason + '\n';
+            round.record_error(error_line);
+            if (round.verbose_output) {
+                round.results[index].output = error_line;
+                round.results[index].connect_failed = connect_failed;
+                round.results[index].success = false;
+            }
+        } catch (...) {
+            // Statistics remain correct even if diagnostic allocation fails.
+        }
+    }
+
+    std::size_t queue_capacity_;
+    std::string server_ip_;
+    std::uint16_t server_port_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_not_empty_;
+    std::condition_variable queue_not_full_;
+    std::deque<RequestJob> queue_;
+    bool stopping_ = false;
+    std::vector<std::thread> workers_;
+};
+
+bool wait_between_rounds(int delay_ms) {
+    auto remaining = std::chrono::milliseconds(delay_ms);
+    constexpr auto check_interval = std::chrono::milliseconds(50);
+    while (remaining.count() > 0 && g_stop_requested == 0) {
+        const auto sleep_time = std::min(remaining, check_interval);
+        std::this_thread::sleep_for(sleep_time);
+        remaining -= sleep_time;
+    }
+    return g_stop_requested == 0;
+}
+
 // Parses benchmark options, loads request keys, and runs bounded-concurrency
 // request rounds. argc/argv contain the server endpoint and optional controls.
 int main(int argc, char* argv[]) {
     try {
         if (argc < 3) {
             throw std::invalid_argument(
-                "Usage: ./tcp_client <server_ip> <server_port> [--keys-file <path>] [--request-count <N>] [--forever] [--verbose] [--max-concurrency <N>]");
+                "Usage: ./tcp_client <server_ip> <server_port> [--keys-file <path>] "
+                "[--request-count <N>] [--forever] [--verbose] [--max-concurrency <N>] "
+                "[--queue-capacity <N>] [--round-delay-ms <N>]");
         }
 
         const std::string server_ip = argv[1];
@@ -443,7 +725,10 @@ int main(int argc, char* argv[]) {
         std::size_t request_count = kDefaultRequestCount;
         bool run_forever = false;
         bool verbose_output = false;
-        std::size_t max_concurrency = kDefaultMaxConcurrency;
+        const std::size_t detected_cpu_count = default_max_concurrency();
+        std::size_t max_concurrency = detected_cpu_count;
+        std::size_t queue_capacity = 0; // Derived from worker count unless explicitly set.
+        int round_delay_ms = 0;
 
         for (int i = 3; i < argc; ++i) {
             const std::string_view arg = argv[i];
@@ -462,6 +747,10 @@ int main(int argc, char* argv[]) {
                     throw std::invalid_argument("--request-count must be positive");
                 }
                 request_count = static_cast<std::size_t>(parsed);
+                if (request_count > kMaxRequestsPerRound) {
+                    throw std::invalid_argument("--request-count exceeds hard safety limit " +
+                                                std::to_string(kMaxRequestsPerRound));
+                }
                 ++i;
             } else if (arg == "--forever") {
                 run_forever = true;
@@ -476,145 +765,101 @@ int main(int argc, char* argv[]) {
                     throw std::invalid_argument("--max-concurrency must be positive");
                 }
                 max_concurrency = static_cast<std::size_t>(parsed);
+                if (max_concurrency > kMaxConcurrency) {
+                    throw std::invalid_argument("--max-concurrency exceeds hard safety limit " +
+                                                std::to_string(kMaxConcurrency));
+                }
+                ++i;
+            } else if (arg == "--queue-capacity") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--queue-capacity requires a numeric value");
+                }
+                const int parsed = parse_int_arg(argv[i + 1], "--queue-capacity");
+                if (parsed <= 0) {
+                    throw std::invalid_argument("--queue-capacity must be positive");
+                }
+                queue_capacity = static_cast<std::size_t>(parsed);
+                if (queue_capacity > kMaxQueueCapacity) {
+                    throw std::invalid_argument("--queue-capacity exceeds hard safety limit " +
+                                                std::to_string(kMaxQueueCapacity));
+                }
+                ++i;
+            } else if (arg == "--round-delay-ms") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--round-delay-ms requires a numeric value");
+                }
+                round_delay_ms = parse_int_arg(argv[i + 1], "--round-delay-ms");
+                if (round_delay_ms < 0 || round_delay_ms > kMaxRoundDelayMs) {
+                    throw std::invalid_argument("--round-delay-ms must be in range 0.." +
+                                                std::to_string(kMaxRoundDelayMs));
+                }
                 ++i;
             } else {
                 throw std::invalid_argument("Unknown argument: " + std::string(arg));
             }
         }
 
+        install_termination_signal_handlers();
         const std::vector<std::string> all_requests = load_request_keys(keys_file);
+        const std::size_t worker_count = std::min(request_count, max_concurrency);
+        if (queue_capacity == 0) {
+            queue_capacity = std::min(
+                kMaxQueueCapacity,
+                std::max<std::size_t>(1, std::min(request_count, worker_count * 2)));
+        }
         std::cout << "Loaded " << all_requests.size() << " request key(s) from " << keys_file
                   << ". Sending " << request_count << " request(s) per round"
                   << (run_forever ? " forever" : "")
-                  << " with max concurrency " << max_concurrency
+                  << " with " << worker_count << " persistent worker thread(s)"
+                  << " and queue capacity " << queue_capacity
+                  << " (CPU-aware default detects " << detected_cpu_count << " CPU(s))"
+                  << (round_delay_ms != 0
+                          ? ", round delay " + std::to_string(round_delay_ms) + " ms"
+                          : "")
                   << (verbose_output ? " (verbose mode)." : " (summary mode).")
-                  << std::endl;
+                  << '\n';
+
+        std::random_device random_device;
+        std::mt19937 rng(random_device());
+        BoundedWorkerPool pool(worker_count, queue_capacity, server_ip, server_port);
 
         std::size_t round = 0;
         bool any_request_failed = false;
         do {
-            ++round;
-            const std::vector<std::string> requests = pick_random_requests(all_requests, request_count);
-            std::vector<RequestResult> results;
-            if (verbose_output) {
-                results.resize(requests.size());
+            if (g_stop_requested != 0) {
+                break;
             }
-
-            const std::size_t worker_count = std::min<std::size_t>(
-                requests.size(),
-                std::max<std::size_t>(1, max_concurrency));
-
-            std::atomic<std::size_t> next_index{0};
-            std::atomic<std::size_t> success_count{0};
-            std::atomic<std::size_t> connect_failed_count{0};
-            std::atomic<std::size_t> failed_count{0};
-            std::atomic<std::size_t> bytes_received_total{0};
-            std::vector<std::string> sample_errors;
-            sample_errors.reserve(kMaxPrintedErrorsPerRound);
-            std::mutex sample_errors_mtx;
-
-            auto maybe_record_error = [&](std::string msg) {
-                std::lock_guard<std::mutex> lk(sample_errors_mtx);
-                if (sample_errors.size() < kMaxPrintedErrorsPerRound) {
-                    sample_errors.push_back(std::move(msg));
-                }
-            };
-
-            std::vector<std::thread> workers;
-            workers.reserve(worker_count);
+            ++round;
+            auto round_state = std::make_shared<RoundState>(
+                pick_random_requests(all_requests, request_count, rng), verbose_output);
             const auto round_started = std::chrono::steady_clock::now();
 
-            try {
-                for (std::size_t worker_i = 0; worker_i < worker_count; ++worker_i) {
-                    workers.emplace_back([&] {
-                        while (true) {
-                            const std::size_t i = next_index.fetch_add(1, std::memory_order_relaxed);
-                            if (i >= requests.size()) {
-                                return;
-                            }
-
-                            if (verbose_output) {
-                                results[i].request = requests[i];
-                            }
-
-                            try {
-                                TcpClient client(server_ip, server_port);
-                                client.connect_to_server();
-                                client.send_request(requests[i]);
-                                client.shutdown_write();
-
-                                std::vector<std::uint8_t> response = client.receive_response();
-                                if (response.size() < tcp_common::kMinPayloadSize ||
-                                    response.size() > tcp_common::kMaxPayloadSize) {
-                                    throw std::runtime_error(
-                                        "response size " + std::to_string(response.size()) +
-                                        " is outside expected range " + payload_range_string());
-                                }
-                                bytes_received_total.fetch_add(response.size(), std::memory_order_relaxed);
-                                success_count.fetch_add(1, std::memory_order_relaxed);
-
-                                if (verbose_output) {
-                                    std::ostringstream out;
-                                    out << "Request: " << requests[i] << '\n';
-                                    out << "Received " << response.size() << " byte(s) from server\n";
-                                    out << render_hex_dump(response);
-                                    results[i].output = out.str();
-                                    results[i].connect_failed = false;
-                                    results[i].success = true;
-                                    results[i].response_bytes = response.size();
-                                }
-                            } catch (const ConnectError& ex) {
-                                connect_failed_count.fetch_add(1, std::memory_order_relaxed);
-                                failed_count.fetch_add(1, std::memory_order_relaxed);
-                                const std::string error_line = std::string("Request: ") + requests[i] +
-                                                               "\nError: " + ex.what() + '\n';
-                                maybe_record_error(error_line);
-                                if (verbose_output) {
-                                    results[i].output = error_line;
-                                    results[i].connect_failed = true;
-                                    results[i].success = false;
-                                }
-                            } catch (const std::exception& ex) {
-                                failed_count.fetch_add(1, std::memory_order_relaxed);
-                                const std::string error_line = std::string("Request: ") + requests[i] +
-                                                               "\nError: " + ex.what() + '\n';
-                                maybe_record_error(error_line);
-                                if (verbose_output) {
-                                    results[i].output = error_line;
-                                    results[i].connect_failed = false;
-                                    results[i].success = false;
-                                }
-                            }
-                        }
-                    });
+            bool submitted_all = true;
+            for (std::size_t i = 0; i < round_state->requests.size(); ++i) {
+                if (!pool.submit(RequestJob{round_state, i})) {
+                    submitted_all = false;
+                    break;
                 }
-            } catch (...) {
-                for (auto& worker : workers) {
-                    if (worker.joinable()) {
-                        worker.join();
-                    }
-                }
-                throw;
             }
-
-            for (auto& worker : workers) {
-                if (worker.joinable()) {
-                    worker.join();
-                }
+            if (!submitted_all || !round_state->wait_until_complete_or_stopped()) {
+                pool.request_stop();
+                break;
             }
 
             const auto round_finished = std::chrono::steady_clock::now();
             const double elapsed_seconds =
                 std::chrono::duration<double>(round_finished - round_started).count();
 
-            const std::size_t success = success_count.load(std::memory_order_relaxed);
-            const std::size_t connect_failed = connect_failed_count.load(std::memory_order_relaxed);
-            const std::size_t failed = failed_count.load(std::memory_order_relaxed);
-            const std::size_t total_bytes = bytes_received_total.load(std::memory_order_relaxed);
+            const std::size_t success = round_state->success_count.load(std::memory_order_relaxed);
+            const std::size_t connect_failed =
+                round_state->connect_failed_count.load(std::memory_order_relaxed);
+            const std::size_t failed = round_state->failed_count.load(std::memory_order_relaxed);
+            const std::size_t total_bytes =
+                round_state->bytes_received_total.load(std::memory_order_relaxed);
             any_request_failed = any_request_failed || failed != 0;
             const double requests_per_second =
                 elapsed_seconds > 0.0
-                    ? static_cast<double>(requests.size()) / elapsed_seconds
+                    ? static_cast<double>(round_state->requests.size()) / elapsed_seconds
                     : 0.0;
             const double successful_mib_per_second =
                 elapsed_seconds > 0.0
@@ -633,21 +878,22 @@ int main(int argc, char* argv[]) {
                       << " successful_MiB_per_second=" << successful_mib_per_second
                       << std::endl;
             if (verbose_output) {
-                for (const auto& result : results) {
+                for (const auto& result : round_state->results) {
                     std::cout << "----------------------------------------\n";
                     std::cout << result.output;
                 }
             } else {
-                if (!sample_errors.empty()) {
-                    std::cout << "Sample errors (up to " << sample_errors.size() << "):\n";
-                    for (const auto& err : sample_errors) {
+                if (!round_state->sample_errors.empty()) {
+                    std::cout << "Sample errors (up to " << round_state->sample_errors.size()
+                              << "):\n";
+                    for (const auto& err : round_state->sample_errors) {
                         std::cout << "----------------------------------------\n";
                         std::cout << err;
                     }
                 }
             }
 
-            if (connect_failed == requests.size()) {
+            if (connect_failed == round_state->requests.size()) {
                 std::cerr << "Unable to reach TCP server " << server_ip << ':' << server_port
                           << ": every connection attempt failed in round " << round
                           << ". Verify the server IP address, listening port, server process, "
@@ -655,7 +901,20 @@ int main(int argc, char* argv[]) {
                           << std::endl;
                 break;
             }
+
+            if (run_forever && round_delay_ms > 0 && !wait_between_rounds(round_delay_ms)) {
+                break;
+            }
         } while (run_forever);
+
+        pool.request_stop();
+        pool.join();
+
+        if (g_stop_requested != 0) {
+            std::cerr << "Termination signal " << g_stop_requested
+                      << " received; worker pool stopped and joined.\n";
+            return 128 + g_stop_requested;
+        }
 
         return any_request_failed ? 2 : 0;
     } catch (const std::exception& ex) {

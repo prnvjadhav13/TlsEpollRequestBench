@@ -50,8 +50,11 @@ The main components are:
   default `mmap-view` loader indexes keys and keeps response views in the mapped
   file, avoiding duplicate user-space payload storage.
 - `tcp_client` opens concurrent connections and reports success, throughput,
-  response bandwidth, and categorized connection failures. Each client worker
-  repeatedly performs one complete request/response transaction at a time.
+  response bandwidth, and categorized connection failures. It creates a fixed
+  worker-thread set once, feeds it through a bounded condition-variable queue,
+  and reuses those threads across all rounds. Each worker performs one complete
+  request/response transaction at a time and sleeps without busy-spinning when
+  the queue is empty.
 - `server_request_response_mapping.bin` stays on the server and contains keys
   plus binary response payloads.
 - `client_request_keys.txt` contains only valid keys and can be copied to a
@@ -62,6 +65,13 @@ client sends a newline-terminated request key. A known key returns its binary
 payload, after which the server closes the connection. An empty, oversized, or
 unknown request is closed without a response. Consequently, benchmark results
 include TCP connection establishment and teardown costs.
+
+Client rounds have an intentional completion barrier: all requests in a round
+finish before its consolidated statistics and optional ordered verbose results
+are printed, and only then may the next `--forever` round begin. This makes
+rounds independently comparable. It introduces a small between-round barrier;
+a continuous interval-reporting load generator would be preferable when the
+only objective is maximum uninterrupted throughput.
 
 ## Requirements
 
@@ -285,10 +295,29 @@ teardown cost.
 ## Useful client options
 
 - `--request-count N`: requests sent in each round
-- `--max-concurrency N`: maximum worker threads and in-flight requests
+- `--max-concurrency N`: maximum worker threads and in-flight requests; the
+  default is one worker per CPU reported as available to the process (or one
+  worker if CPU detection is unavailable)
+- `--queue-capacity N`: bounded number of requests waiting for workers; the
+  default is twice the effective worker count, capped by the requests in one
+  round
+- `--round-delay-ms N`: interruptible delay between `--forever` rounds; useful
+  for pacing sustained tests and reducing reconnect pressure
 - `--forever`: repeat rounds until interrupted
 - `--verbose`: print each binary response as a hex dump; debugging only
 - `--keys-file PATH`: use a non-default key file
+
+The client creates its worker threads once and joins them once at shutdown.
+The CPU-aware default is deliberately conservative because every request opens
+and closes a TCP connection. For example, a two-CPU machine defaults to two
+workers. Higher concurrency can improve throughput when workers spend most of
+their time waiting on a remote network, but should be enabled explicitly after
+measuring CPU use, latency, and failures.
+The first SIGINT or SIGTERM stops submission, discards queued work, allows
+active socket operations to finish within their five-second timeout, and joins
+the workers. A second signal exits immediately. Per-request sockets are not
+reused: doing so would require changing both sides from the current
+half-close/read-until-EOF protocol to explicit request and response framing.
 
 ## Mapping loaders
 
