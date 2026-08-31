@@ -45,6 +45,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <boost/unordered/unordered_flat_map.hpp>
+
+
 #include "tcp_common_config.h"
 #include "tcp_server_epoll.h"
 
@@ -246,7 +249,12 @@ struct TransparentStringEqual {
     }
 };
 
-using RequestMap = std::unordered_map<std::string, ClientResponse, TransparentStringHash, TransparentStringEqual>;
+// Open addressing keeps lookup metadata and entries in contiguous allocations,
+// improving cache locality for the immutable, lookup-heavy request index.
+using RequestMap = boost::unordered_flat_map<std::string,
+                                             ClientResponse,
+                                             TransparentStringHash,
+                                             TransparentStringEqual>;
 
 // Selects whether mapping payloads are read into memory or referenced directly
 // from a memory-mapped file.
@@ -264,10 +272,10 @@ struct ResponseBufferView {
 };
 
 using MappedPayloadView = std::span<const std::uint8_t>;
-using MappedRequestMap = std::unordered_map<std::string_view,
-                                            MappedPayloadView,
-                                            TransparentStringHash,
-                                            TransparentStringEqual>;
+using MappedRequestMap = boost::unordered_flat_map<std::string_view,
+                                                   MappedPayloadView,
+                                                   TransparentStringHash,
+                                                   TransparentStringEqual>;
 
 class MappedRegion;
 
