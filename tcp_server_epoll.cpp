@@ -42,6 +42,7 @@
 #include <sys/signalfd.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <unistd.h>
@@ -66,6 +67,8 @@ constexpr auto kEpollWaitTimeout = std::chrono::milliseconds(250);
 constexpr auto kGraceShutdownTimeout = std::chrono::seconds(30);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 constexpr auto kAcceptCapacityBackoff = std::chrono::milliseconds(10);
+static_assert(tcp_common::kMaxPayloadSize <=
+              static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()));
 
 // Describes the process-wide transition from accepting traffic, through a
 // graceful drain, to forced worker termination.
@@ -1139,7 +1142,9 @@ struct ConnectionState {
     UniqueFd socket;
     std::string request_line;
     ResponseBufferView response{};
+    std::array<std::uint8_t, sizeof(std::uint32_t)> response_header{};
     std::unique_ptr<PipelinedResponseOverflow> response_overflow;
+    std::size_t response_header_sent = 0;
     std::size_t response_sent = 0;
     std::uint64_t expiration_tick = 0;
     int wheel_previous = -1;
@@ -1156,9 +1161,20 @@ struct ConnectionState {
     [[nodiscard]] ResponseBufferView& current_response() noexcept {
         return response;
     }
+    void set_current_response(ResponseBufferView next_response) noexcept {
+        response = next_response;
+        const auto size = static_cast<std::uint32_t>(next_response.size);
+        response_header = {
+            static_cast<std::uint8_t>(size >> 24U),
+            static_cast<std::uint8_t>(size >> 16U),
+            static_cast<std::uint8_t>(size >> 8U),
+            static_cast<std::uint8_t>(size)};
+        response_header_sent = 0;
+        response_sent = 0;
+    }
     [[nodiscard]] bool push_response(ResponseBufferView next_response) noexcept {
         if (!has_responses()) [[likely]] {
-            response = next_response;
+            set_current_response(next_response);
             return true;
         }
         if (response_overflow == nullptr) {
@@ -1179,19 +1195,22 @@ struct ConnectionState {
         return true;
     }
     void pop_response() noexcept {
-        response_sent = 0;
         if (response_overflow == nullptr || response_overflow->count == 0) [[likely]] {
             response = {};
+            response_header_sent = 0;
+            response_sent = 0;
             response_overflow.reset();
             return;
         }
-        response = response_overflow->responses[response_overflow->head];
+        const ResponseBufferView next_response =
+            response_overflow->responses[response_overflow->head];
         response_overflow->head =
             (response_overflow->head + 1) % PipelinedResponseOverflow::kCapacity;
         --response_overflow->count;
         if (response_overflow->count == 0) {
             response_overflow.reset();
         }
+        set_current_response(next_response);
     }
 };
 
@@ -1885,12 +1904,38 @@ private:
         std::size_t bytes_written = 0;
         while (connection.has_responses() && bytes_written < kMaxWriteBytesPerEvent) {
             const ResponseBufferView& response = connection.current_response();
-            const std::size_t remaining = response.size - connection.response_sent;
-            const std::size_t write_size = std::min(remaining, kMaxWriteBytesPerEvent - bytes_written);
-            const ssize_t n = ::send(connection.fd(),
-                                     response.data + connection.response_sent,
-                                     write_size,
-                                     MSG_NOSIGNAL | MSG_DONTWAIT);
+            const std::size_t budget = kMaxWriteBytesPerEvent - bytes_written;
+            const std::size_t header_remaining =
+                connection.response_header.size() - connection.response_header_sent;
+            const std::size_t header_size = std::min(header_remaining, budget);
+            const std::size_t payload_budget = budget - header_size;
+            const std::size_t payload_remaining = response.size - connection.response_sent;
+            const std::size_t payload_size = std::min(payload_remaining, payload_budget);
+
+            // A single vectored write normally emits the framing header and payload
+            // together. This preserves zero-copy views into the immutable mapping
+            // while avoiding a syscall and a small TCP segment per response.
+            std::array<iovec, 2> vectors{};
+            int vector_count = 0;
+            if (header_size != 0) {
+                vectors[static_cast<std::size_t>(vector_count++)] = iovec{
+                    .iov_base = connection.response_header.data() +
+                                connection.response_header_sent,
+                    .iov_len = header_size};
+            }
+            if (payload_size != 0) {
+                vectors[static_cast<std::size_t>(vector_count++)] = iovec{
+                    .iov_base = const_cast<std::uint8_t*>(response.data +
+                                                         connection.response_sent),
+                    .iov_len = payload_size};
+            }
+
+            msghdr message{};
+            message.msg_iov = vectors.data();
+            message.msg_iovlen = static_cast<std::size_t>(vector_count);
+            const ssize_t n = ::sendmsg(connection.fd(),
+                                        &message,
+                                        MSG_NOSIGNAL | MSG_DONTWAIT);
             if (n < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -1904,15 +1949,19 @@ private:
                 return false;
             }
 
-            connection.response_sent += static_cast<std::size_t>(n);
-            bytes_written += static_cast<std::size_t>(n);
+            const std::size_t sent = static_cast<std::size_t>(n);
+            const std::size_t header_sent = std::min(sent, header_size);
+            connection.response_header_sent += header_sent;
+            connection.response_sent += sent - header_sent;
+            bytes_written += sent;
             // A half-closed peer is closed as soon as its queued responses are
             // flushed, so moving it within the timing wheel cannot affect its
             // lifetime and only adds hash lookups on the one-shot hot path.
             if (!connection.peer_write_closed) {
                 touch(connection);
             }
-            if (connection.response_sent == response.size) {
+            if (connection.response_header_sent == connection.response_header.size() &&
+                connection.response_sent == response.size) {
                 connection.pop_response();
             }
         }
@@ -2215,6 +2264,39 @@ void start_listen(int listen_port,
 
 // Parses server and mapping options, initializes the shared request mapping,
 // optionally exports keys, and starts listeners. argc/argv are the CLI inputs.
+void print_server_usage(std::ostream& output, std::string_view program) {
+    output
+        << "Usage:\n"
+        << "  " << program << " --listen <port> [options]\n"
+        << "  " << program << " --export-keys <count> [options]\n\n"
+        << "Options:\n"
+        << "  -h, --help                         Show this help and exit\n"
+        << "  --listen <port>                    Listen on TCP port 1..65535\n"
+        << "  --mapping-file <path>              Mapping file (default: "
+        << tcp_common::kDefaultServerMappingFile << ")\n"
+        << "  --mapping-loader <mode>            ifstream, mmap, or mmap-view\n"
+        << "                                      (default: mmap-view)\n"
+        << "  --regen-mapping                    Regenerate the mapping file\n"
+        << "  --mapping-entries <count>          Entries generated with --regen-mapping\n"
+        << "  --event-loops <count>              Epoll worker count (default: CPU count)\n"
+        << "  --max-connections-per-loop <count> Connection limit per epoll worker\n"
+        << "                                      (default: 10000)\n"
+        << "  --idle-timeout-seconds <seconds>   Positive idle timeout (default: "
+        << kDefaultIdleTimeout.count() << ")\n"
+        << "  --export-keys <count>              Export request keys for tcp_client\n"
+        << "  --keys-output <path>               Export destination (default: "
+        << tcp_common::kDefaultClientKeysFile << ")\n\n"
+        << "Examples:\n"
+        << "  " << program << " --listen 23456 --mapping-file "
+        << tcp_common::kDefaultServerMappingFile << "\n"
+        << "  " << program
+        << " --listen 23456 --mapping-file server --mapping-loader mmap-view\n"
+        << "  " << program
+        << " --regen-mapping --mapping-entries 500000 --export-keys 500000\n\n"
+        << "Options use a space between the option and its value; for example,\n"
+        << "--mapping-file server (not --mapping-file=server).\n";
+}
+
 int main(int argc, char* argv[]) {
     try {
         int listen_port = 0;
@@ -2233,13 +2315,15 @@ int main(int argc, char* argv[]) {
         std::chrono::seconds idle_timeout = kDefaultIdleTimeout;
 
         if (argc < 2) {
-            throw std::invalid_argument(
-                "Usage: ./tcp_server_epoll [--listen <port>] [--mapping-file <path>] [--mapping-loader <ifstream|mmap|mmap-view>] [--mapping-entries <N>] [--event-loops <N>] [--max-connections-per-loop <N>] [--idle-timeout-seconds <N>] [--regen-mapping] [--export-keys <N>] [--keys-output <path>]");
+            throw std::invalid_argument("no mode or option was provided");
         }
 
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg = argv[i];
-            if (arg == "--listen") {
+            if (arg == "--help" || arg == "-h") {
+                print_server_usage(std::cout, argv[0]);
+                return 0;
+            } else if (arg == "--listen") {
                 if (i + 1 >= argc) {
                     throw std::invalid_argument("--listen requires a port value");
                 }
@@ -2387,6 +2471,11 @@ int main(int argc, char* argv[]) {
                      max_connections_per_loop,
                      std::move(port_instance_lock));
         return 0;
+    } catch (const std::invalid_argument& ex) {
+        std::cerr << "Error: " << ex.what() << std::endl;
+        std::cerr << '\n';
+        print_server_usage(std::cerr, argc > 0 ? argv[0] : "tcp_server_epoll");
+        return 1;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;

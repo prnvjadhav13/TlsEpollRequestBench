@@ -50,26 +50,26 @@ The main components are:
 - The server loads `server_request_response_mapping.bin` once at startup. The
   default `mmap-view` loader indexes keys and keeps response views in the mapped
   file, avoiding duplicate user-space payload storage.
-- `tcp_client` opens concurrent connections and reports success, throughput,
+- `tcp_client` opens one persistent connection per worker and reports success, throughput,
   response bandwidth, and categorized connection failures. It creates a fixed
   worker-thread set once, feeds it through a bounded condition-variable queue,
   and reuses those threads across all rounds. Each worker performs one complete
-  request/response transaction at a time and sleeps without busy-spinning when
-  the queue is empty.
+  framed request/response transaction at a time on that connection and sleeps
+  without busy-spinning when the queue is empty. A stale connection is replaced
+  automatically and the read-only request is retried once.
 - `server_request_response_mapping.bin` stays on the server and contains keys
   plus binary response payloads.
 - `client_request_keys.txt` contains only valid keys and can be copied to a
   test-client machine.
 
 The deliberately small protocol accepts newline-terminated request keys. A
-known key returns its binary payload. The server supports keep-alive and up to
-16 pipelined responses per connection; responses are emitted in request order.
+known key returns a four-byte big-endian payload length followed by its binary
+payload. The server supports keep-alive and up to 16 pipelined responses per
+connection; responses are emitted in request order.
 An empty, oversized, unknown, or excessively pipelined request closes the
-connection. The bundled benchmark client still performs one transaction per
-connection and half-closes its write side, so its results include TCP connection
-establishment and teardown costs. This is not HTTP and has no `Content-Length`
-header; a reusable client must already know each expected payload length or add
-an application framing layer.
+connection. The bundled client reuses one connection per worker across requests
+and rounds. This is not HTTP; the binary length prefix is the response-framing
+contract and is included in network bytes but excluded from payload statistics.
 
 Client rounds have an intentional completion barrier: all requests in a round
 finish before its consolidated statistics and optional ordered verbose results
@@ -295,8 +295,9 @@ ulimit -n
 
 Choose `--event-loops` based on measurement. The number of available CPU cores
 is a reasonable starting point, but more loops are not automatically faster.
-Each request uses a new TCP connection, so results include connection setup and
-teardown cost.
+Each worker reuses one TCP connection. Connection setup and teardown are
+amortized across its requests; a reconnect is performed after a stale socket or
+I/O failure.
 
 ## Useful client options
 
@@ -313,18 +314,16 @@ teardown cost.
 - `--verbose`: print each binary response as a hex dump; debugging only
 - `--keys-file PATH`: use a non-default key file
 
-The client creates its worker threads once and joins them once at shutdown.
-The CPU-aware default is deliberately conservative because every request opens
-and closes a TCP connection. For example, a two-CPU machine defaults to two
-workers. Higher concurrency can improve throughput when workers spend most of
-their time waiting on a remote network, but should be enabled explicitly after
-measuring CPU use, latency, and failures.
+The client creates its worker threads and per-worker connections once and joins
+them at shutdown. The CPU-aware default is deliberately conservative. For
+example, a two-CPU machine defaults to two workers. Higher concurrency can
+improve throughput when workers spend most of their time waiting on a remote
+network, but should be enabled explicitly after measuring CPU use, latency, and
+failures.
 The first SIGINT or SIGTERM stops submission, discards queued work, allows
-active socket operations to finish within their five-second timeout, and joins
-the workers. A second signal exits immediately. The bundled client does not
-reuse per-request sockets. The server accepts multiple newline-delimited
-requests per socket, but a general reusable client needs explicit response
-framing because payloads are binary and variable-sized.
+active socket operations to finish within their five-second timeout, closes
+each worker's persistent socket, and joins the workers. A second signal exits
+immediately.
 
 ## Mapping loaders
 

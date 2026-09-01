@@ -43,6 +43,7 @@ constexpr std::size_t kMaxPrintedErrorsPerRound = 10;
 constexpr std::size_t kMaxConcurrency = 4096;
 constexpr std::size_t kMaxRequestsPerRound = 10'000'000;
 constexpr std::size_t kMaxQueueCapacity = 1'000'000;
+constexpr std::size_t kRequestsPerJob = 16;
 constexpr int kMaxRoundDelayMs = 3'600'000;
 
 volatile std::sig_atomic_t g_stop_requested = 0;
@@ -103,6 +104,8 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+std::string payload_range_string();
+
 // Move-only RAII owner for a socket file descriptor; construction accepts an
 // already-open descriptor and destruction closes it.
 class Socket {
@@ -111,7 +114,7 @@ public:
 
     explicit Socket(int fd) : fd_(fd) {}
 
-    ~Socket() {
+    ~Socket() noexcept {
         reset();
     }
 
@@ -154,12 +157,13 @@ private:
 // server_ip and server_port identify the endpoint used by connect_to_server().
 class TcpClient {
 public:
-    TcpClient(std::string server_ip, std::uint16_t server_port)
-        : server_ip_(std::move(server_ip)), server_port_(server_port) {}
+    TcpClient(const std::string& server_ip, std::uint16_t server_port) noexcept
+        : server_ip_(server_ip), server_port_(server_port) {}
 
     // Opens the configured endpoint with a bounded nonblocking connect, then
     // switches to blocking I/O with send and receive timeouts.
     void connect_to_server() {
+        socket_.reset();
         const int fd = ::socket(AF_INET,
                                 SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                                 IPPROTO_TCP);
@@ -195,54 +199,47 @@ public:
         set_socket_io_timeout(socket_.get(), kClientIoTimeout);
     }
 
+    [[nodiscard]] bool connected() const noexcept {
+        return socket_.valid();
+    }
+
+    void disconnect() noexcept {
+        socket_.reset();
+    }
+
     // Sends request as the protocol's newline-terminated request key.
     void send_request(std::string_view request) {
-        std::string framed_request(request);
-        if (framed_request.empty() || framed_request.back() != '\n') {
-            framed_request.push_back('\n');
+        if (request.empty() || request.size() > tcp_common::kMaxRequestKeySize) {
+            throw std::invalid_argument("request length is outside the supported range");
         }
-
-        send_all(reinterpret_cast<const std::uint8_t*>(framed_request.data()),
-                 framed_request.size());
+        if (request.back() == '\n') {
+            send_all(reinterpret_cast<const std::uint8_t*>(request.data()), request.size());
+            return;
+        }
+        std::array<std::uint8_t, tcp_common::kMaxRequestKeySize + 1> framed_request{};
+        std::memcpy(framed_request.data(), request.data(), request.size());
+        framed_request[request.size()] = '\n';
+        send_all(framed_request.data(), request.size() + 1);
     }
 
-    // Half-closes the connected socket to tell the server no more request
-    // bytes will follow while leaving the read side open for the response.
-    void shutdown_write() {
-        if (socket_.valid() && ::shutdown(socket_.get(), SHUT_WR) < 0) {
-            throw std::runtime_error(std::string("shutdown(SHUT_WR) failed: ") + std::strerror(errno));
+    // Reads one length-prefixed response while leaving the socket connected for
+    // the next request handled by this worker.
+    void receive_response(std::vector<std::uint8_t>& response) {
+        std::array<std::uint8_t, sizeof(std::uint32_t)> header{};
+        receive_exact(header.data(), header.size());
+        const std::uint32_t payload_size =
+            (static_cast<std::uint32_t>(header[0]) << 24U) |
+            (static_cast<std::uint32_t>(header[1]) << 16U) |
+            (static_cast<std::uint32_t>(header[2]) << 8U) |
+            static_cast<std::uint32_t>(header[3]);
+        if (payload_size < tcp_common::kMinPayloadSize ||
+            payload_size > tcp_common::kMaxPayloadSize) {
+            throw std::runtime_error(
+                "response payload length is outside expected range " +
+                payload_range_string());
         }
-    }
-
-    // Reads response bytes until the server closes its write side and returns
-    // the complete binary payload.
-    std::vector<std::uint8_t> receive_response() {
-        std::vector<std::uint8_t> response;
-        std::vector<std::uint8_t> buffer(1024);
-
-        while (true) {
-            ssize_t n = ::recv(socket_.get(), buffer.data(), buffer.size(), 0);
-            if (n < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                throw std::runtime_error(std::string("recv failed: ") + std::strerror(errno));
-            }
-            if (n == 0) {
-                break;
-            }
-
-            const auto received = static_cast<std::size_t>(n);
-            if (received > tcp_common::kMaxPayloadSize - response.size()) {
-                throw std::runtime_error(
-                    "response exceeds maximum supported size " +
-                    std::to_string(tcp_common::kMaxPayloadSize));
-            }
-
-            response.insert(response.end(), buffer.begin(), buffer.begin() + n);
-        }
-
-        return response;
+        response.resize(payload_size);
+        receive_exact(response.data(), response.size());
     }
 
 private:
@@ -357,7 +354,25 @@ private:
         }
     }
 
-    std::string server_ip_;
+    // Receives exactly size bytes or reports a stale/failed persistent socket.
+    void receive_exact(std::uint8_t* data, std::size_t size) {
+        std::size_t received = 0;
+        while (received < size) {
+            const ssize_t n = ::recv(socket_.get(), data + received, size - received, 0);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(std::string("recv failed: ") + std::strerror(errno));
+            }
+            if (n == 0) {
+                throw std::runtime_error("server closed persistent connection during response");
+            }
+            received += static_cast<std::size_t>(n);
+        }
+    }
+
+    const std::string& server_ip_;
     std::uint16_t server_port_;
     Socket socket_;
 };
@@ -491,11 +506,10 @@ struct RoundState {
         }
     }
 
-    void complete_one() noexcept {
+    void complete(std::size_t count) noexcept {
         std::lock_guard<std::mutex> lock(completion_mutex);
-        if (remaining > 0) {
-            --remaining;
-        }
+        const std::size_t completed = std::min(count, remaining);
+        remaining -= completed;
         if (remaining == 0) {
             completion_cv.notify_all();
         }
@@ -527,7 +541,8 @@ private:
 
 struct RequestJob {
     std::shared_ptr<RoundState> round;
-    std::size_t index = 0;
+    std::size_t begin = 0;
+    std::size_t end = 0;
 };
 
 // Fixed-size worker pool with a bounded FIFO. Threads are created once and
@@ -553,13 +568,15 @@ public:
         }
     }
 
-    ~BoundedWorkerPool() {
+    ~BoundedWorkerPool() noexcept {
         request_stop();
         join();
     }
 
     BoundedWorkerPool(const BoundedWorkerPool&) = delete;
     BoundedWorkerPool& operator=(const BoundedWorkerPool&) = delete;
+    BoundedWorkerPool(BoundedWorkerPool&&) = delete;
+    BoundedWorkerPool& operator=(BoundedWorkerPool&&) = delete;
 
     [[nodiscard]] bool submit(RequestJob job) {
         std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -598,6 +615,9 @@ public:
 
 private:
     void worker_loop() noexcept {
+        TcpClient client(server_ip_, server_port_);
+        std::vector<std::uint8_t> response;
+        response.reserve(tcp_common::kMaxPayloadSize);
         for (;;) {
             RequestJob job;
             {
@@ -613,53 +633,68 @@ private:
                 queue_not_full_.notify_one();
             }
 
-            process(job);
-            job.round->complete_one();
+            for (std::size_t index = job.begin; index < job.end; ++index) {
+                process(*job.round, index, client, response);
+            }
+            job.round->complete(job.end - job.begin);
         }
     }
 
-    void process(const RequestJob& job) noexcept {
-        RoundState& round = *job.round;
-        const std::size_t i = job.index;
-        try {
-            if (round.verbose_output) {
-                round.results[i].request = round.requests[i];
-            }
+    void process(RoundState& round,
+                 std::size_t i,
+                 TcpClient& client,
+                 std::vector<std::uint8_t>& response) noexcept {
+        constexpr std::size_t kMaxAttempts = 2;
+        for (std::size_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            try {
+                if (attempt == 0 && round.verbose_output) {
+                    round.results[i].request = round.requests[i];
+                }
+                if (!client.connected()) {
+                    client.connect_to_server();
+                }
+                client.send_request(round.requests[i]);
+                client.receive_response(response);
+                round.bytes_received_total.fetch_add(response.size(), std::memory_order_relaxed);
+                round.success_count.fetch_add(1, std::memory_order_relaxed);
 
-            TcpClient client(server_ip_, server_port_);
-            client.connect_to_server();
-            client.send_request(round.requests[i]);
-            client.shutdown_write();
-
-            std::vector<std::uint8_t> response = client.receive_response();
-            if (response.size() < tcp_common::kMinPayloadSize) {
-                throw std::runtime_error(
-                    "response size " + std::to_string(response.size()) +
-                    " is outside expected range " + payload_range_string());
+                if (round.verbose_output) {
+                    std::ostringstream out;
+                    out << "Request: " << round.requests[i] << '\n';
+                    out << "Received " << response.size() << " byte(s) from server\n";
+                    out << render_hex_dump(response);
+                    round.results[i].output = out.str();
+                    round.results[i].connect_failed = false;
+                    round.results[i].success = true;
+                    round.results[i].response_bytes = response.size();
+                }
+                return;
+            } catch (const ConnectError& error) {
+                client.disconnect();
+                if (attempt + 1 < kMaxAttempts) {
+                    continue;
+                }
+                round.connect_failed_count.fetch_add(1, std::memory_order_relaxed);
+                round.failed_count.fetch_add(1, std::memory_order_relaxed);
+                record_failure(round, i, error.what(), true);
+                return;
+            } catch (const std::exception& error) {
+                client.disconnect();
+                if (attempt + 1 < kMaxAttempts) {
+                    continue;
+                }
+                round.failed_count.fetch_add(1, std::memory_order_relaxed);
+                record_failure(round, i, error.what(), false);
+                return;
+            } catch (...) {
+                client.disconnect();
+                if (attempt + 1 < kMaxAttempts) {
+                    continue;
+                }
+                round.failed_count.fetch_add(1, std::memory_order_relaxed);
+                record_failure(round, i, "unknown non-standard exception", false);
+                return;
             }
-            round.bytes_received_total.fetch_add(response.size(), std::memory_order_relaxed);
-            round.success_count.fetch_add(1, std::memory_order_relaxed);
-
-            if (round.verbose_output) {
-                std::ostringstream out;
-                out << "Request: " << round.requests[i] << '\n';
-                out << "Received " << response.size() << " byte(s) from server\n";
-                out << render_hex_dump(response);
-                round.results[i].output = out.str();
-                round.results[i].connect_failed = false;
-                round.results[i].success = true;
-                round.results[i].response_bytes = response.size();
-            }
-        } catch (const ConnectError& error) {
-            round.connect_failed_count.fetch_add(1, std::memory_order_relaxed);
-            round.failed_count.fetch_add(1, std::memory_order_relaxed);
-            record_failure(round, i, error.what(), true);
-        } catch (const std::exception& error) {
-            round.failed_count.fetch_add(1, std::memory_order_relaxed);
-            record_failure(round, i, error.what(), false);
-        } catch (...) {
-            round.failed_count.fetch_add(1, std::memory_order_relaxed);
-            record_failure(round, i, "unknown non-standard exception", false);
         }
     }
 
@@ -705,13 +740,47 @@ bool wait_between_rounds(int delay_ms) {
 
 // Parses benchmark options, loads request keys, and runs bounded-concurrency
 // request rounds. argc/argv contain the server endpoint and optional controls.
+void print_client_usage(std::ostream& output, std::string_view program) {
+    output
+        << "Usage:\n"
+        << "  " << program << " <server-ip> <server-port> [options]\n\n"
+        << "Arguments:\n"
+        << "  <server-ip>                  IPv4 address of tcp_server_epoll\n"
+        << "  <server-port>                Server TCP port in range 1..65535\n\n"
+        << "Options:\n"
+        << "  -h, --help                   Show this help and exit\n"
+        << "  --keys-file <path>           Request-key file (default: "
+        << tcp_common::kDefaultClientKeysFile << ")\n"
+        << "  --request-count <count>      Requests per round (default: "
+        << kDefaultRequestCount << ", maximum: " << kMaxRequestsPerRound << ")\n"
+        << "  --forever                    Repeat request rounds until interrupted\n"
+        << "  --verbose                    Print every request and response\n"
+        << "  --max-concurrency <count>    Persistent worker/socket count\n"
+        << "                                (default: available CPU count, maximum: "
+        << kMaxConcurrency << ")\n"
+        << "  --queue-capacity <count>     Maximum queued jobs (default: 2 per worker,\n"
+        << "                                maximum: " << kMaxQueueCapacity << ")\n"
+        << "  --round-delay-ms <ms>        Delay between --forever rounds (default: 0,\n"
+        << "                                maximum: " << kMaxRoundDelayMs << ")\n\n"
+        << "Examples:\n"
+        << "  " << program << " 127.0.0.1 23456\n"
+        << "  " << program
+        << " 127.0.0.1 23456 --request-count 1000 --max-concurrency 8\n"
+        << "  " << program
+        << " 127.0.0.1 23456 --request-count 1000 --forever --round-delay-ms 1000\n\n"
+        << "Options use a space between the option and its value; for example,\n"
+        << "--request-count 1000 (not --request-count=1000).\n";
+}
+
 int main(int argc, char* argv[]) {
     try {
+        if (argc == 2 &&
+            (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
+            print_client_usage(std::cout, argv[0]);
+            return 0;
+        }
         if (argc < 3) {
-            throw std::invalid_argument(
-                "Usage: ./tcp_client <server_ip> <server_port> [--keys-file <path>] "
-                "[--request-count <N>] [--forever] [--verbose] [--max-concurrency <N>] "
-                "[--queue-capacity <N>] [--round-delay-ms <N>]");
+            throw std::invalid_argument("server IP address and port are required");
         }
 
         const std::string server_ip = argv[1];
@@ -732,7 +801,10 @@ int main(int argc, char* argv[]) {
 
         for (int i = 3; i < argc; ++i) {
             const std::string_view arg = argv[i];
-            if (arg == "--keys-file") {
+            if (arg == "--help" || arg == "-h") {
+                print_client_usage(std::cout, argv[0]);
+                return 0;
+            } else if (arg == "--keys-file") {
                 if (i + 1 >= argc) {
                     throw std::invalid_argument("--keys-file requires a file path");
                 }
@@ -802,6 +874,11 @@ int main(int argc, char* argv[]) {
         install_termination_signal_handlers();
         const std::vector<std::string> all_requests = load_request_keys(keys_file);
         const std::size_t worker_count = std::min(request_count, max_concurrency);
+        const std::size_t target_job_count = worker_count * 4;
+        const std::size_t requests_per_job = std::min(
+            kRequestsPerJob,
+            std::max<std::size_t>(
+                1, (request_count + target_job_count - 1) / target_job_count));
         if (queue_capacity == 0) {
             queue_capacity = std::min(
                 kMaxQueueCapacity,
@@ -812,6 +889,7 @@ int main(int argc, char* argv[]) {
                   << (run_forever ? " forever" : "")
                   << " with " << worker_count << " persistent worker thread(s)"
                   << " and queue capacity " << queue_capacity
+                  << ", up to " << requests_per_job << " request(s) per queued job"
                   << " (CPU-aware default detects " << detected_cpu_count << " CPU(s))"
                   << (round_delay_ms != 0
                           ? ", round delay " + std::to_string(round_delay_ms) + " ms"
@@ -835,8 +913,11 @@ int main(int argc, char* argv[]) {
             const auto round_started = std::chrono::steady_clock::now();
 
             bool submitted_all = true;
-            for (std::size_t i = 0; i < round_state->requests.size(); ++i) {
-                if (!pool.submit(RequestJob{round_state, i})) {
+            for (std::size_t begin = 0; begin < round_state->requests.size();
+                 begin += requests_per_job) {
+                const std::size_t end =
+                    std::min(begin + requests_per_job, round_state->requests.size());
+                if (!pool.submit(RequestJob{round_state, begin, end})) {
                     submitted_all = false;
                     break;
                 }
@@ -917,6 +998,11 @@ int main(int argc, char* argv[]) {
         }
 
         return any_request_failed ? 2 : 0;
+    } catch (const std::invalid_argument& ex) {
+        std::cerr << "Error: " << ex.what() << std::endl;
+        std::cerr << '\n';
+        print_client_usage(std::cerr, argc > 0 ? argv[0] : "tcp_client");
+        return 1;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;
