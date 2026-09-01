@@ -45,8 +45,9 @@ The main components are:
 - `tcp_server_epoll` uses one `epoll` event loop per worker thread.
 - Each server worker owns a `SO_REUSEPORT` listening socket, its active
   connection states, and its allocation-free idle-timeout wheel. Connections
-  use edge-triggered one-shot notifications and remain assigned to one event
-  loop for their lifetime.
+  use edge-triggered notifications and remain assigned to one event loop for
+  their lifetime. Epoll interest is modified only when read/write interest
+  actually changes, avoiding a rearm syscall for each request.
 - The server loads `server_request_response_mapping.bin` once at startup. The
   default `mmap-view` loader indexes keys and keeps response views in the mapped
   file, avoiding duplicate user-space payload storage.

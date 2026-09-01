@@ -69,6 +69,13 @@ constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 constexpr auto kAcceptCapacityBackoff = std::chrono::milliseconds(10);
 static_assert(tcp_common::kMaxPayloadSize <=
               static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()));
+static_assert(kMaxPipelinedResponses *
+                  (tcp_common::kMaxPayloadSize + sizeof(std::uint32_t)) <=
+              kMaxWriteBytesPerEvent,
+              "ET writes must drain the entire bounded response queue per event");
+static_assert(kMaxPipelinedResponses * (kMaxRequestSize + 1) <
+              kMaxReadBytesPerEvent,
+              "ET reads must reach EAGAIN or the bounded pipeline limit per event");
 
 // Describes the process-wide transition from accepting traffic, through a
 // graceful drain, to forced worker termination.
@@ -1152,6 +1159,7 @@ struct ConnectionState {
     std::uint8_t wheel_slot = 0;
     bool wheel_scheduled = false;
     bool peer_write_closed = false;
+    std::uint32_t registered_events = 0;
 
     [[nodiscard]] bool has_responses() const noexcept { return response.size != 0; }
     [[nodiscard]] bool response_queue_full() const noexcept {
@@ -1730,16 +1738,25 @@ private:
         }
     }
 
-    // Rearms an edge-triggered one-shot client after bounded read/write work.
-    bool update_connection_interest(const ConnectionState& connection) noexcept {
-        std::uint32_t events = EPOLLET | EPOLLONESHOT | EPOLLRDHUP | EPOLLERR;
+    // Updates epoll only when read/write interest actually changes. Each
+    // connection belongs to this event-loop thread, so EPOLLONESHOT provides no
+    // synchronization benefit and would require a MOD syscall after every event.
+    bool update_connection_interest(ConnectionState& connection) noexcept {
+        std::uint32_t events = EPOLLET | EPOLLRDHUP | EPOLLERR;
         if (!connection.peer_write_closed) {
             events |= EPOLLIN;
         }
         if (connection.has_responses()) {
             events |= EPOLLOUT;
         }
-        return try_modify_fd(connection.fd(), events);
+        if (events == connection.registered_events) {
+            return true;
+        }
+        if (!try_modify_fd(connection.fd(), events)) {
+            return false;
+        }
+        connection.registered_events = events;
+        return true;
     }
 
     // Accepts a bounded batch from the ready listener, registers each client,
@@ -1794,12 +1811,13 @@ private:
 
                 // Register the socket before publishing its idle deadline.  If epoll
                 // registration fails, the whole connection transaction is rolled back.
-                if (!try_register_connection_fd(
-                        client_fd,
-                        EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP | EPOLLERR)) {
+                constexpr std::uint32_t initial_events =
+                    EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLERR;
+                if (!try_register_connection_fd(client_fd, initial_events)) {
                     connections_.erase(client_fd);
                     continue;
                 }
+                connection.registered_events = initial_events;
 
                 touch(connection);
                 ++stats_.accepted;
@@ -1956,7 +1974,7 @@ private:
             bytes_written += sent;
             // A half-closed peer is closed as soon as its queued responses are
             // flushed, so moving it within the timing wheel cannot affect its
-            // lifetime and only adds hash lookups on the one-shot hot path.
+            // lifetime and only adds hash lookups on the write hot path.
             if (!connection.peer_write_closed) {
                 touch(connection);
             }
