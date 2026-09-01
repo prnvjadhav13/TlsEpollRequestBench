@@ -11,7 +11,7 @@ The project demonstrates how to:
 
 - handle many TCP connections with multiple independent `epoll` event loops;
 - distribute accepted connections across server workers with `SO_REUSEPORT`;
-- process fragmented requests and partial nonblocking writes safely;
+- process fragmented and pipelined requests and partial nonblocking writes safely;
 - enforce connection, request-size, and idle-time limits;
 - keep file descriptors and memory mappings under RAII ownership;
 - separate private server response data from a small client test-key file; and
@@ -44,8 +44,9 @@ The main components are:
 
 - `tcp_server_epoll` uses one `epoll` event loop per worker thread.
 - Each server worker owns a `SO_REUSEPORT` listening socket, its active
-  connection states, and its idle-timeout queue. Connections are nonblocking
-  and remain assigned to one event loop for their lifetime.
+  connection states, and its allocation-free idle-timeout wheel. Connections
+  use edge-triggered one-shot notifications and remain assigned to one event
+  loop for their lifetime.
 - The server loads `server_request_response_mapping.bin` once at startup. The
   default `mmap-view` loader indexes keys and keeps response views in the mapped
   file, avoiding duplicate user-space payload storage.
@@ -60,11 +61,15 @@ The main components are:
 - `client_request_keys.txt` contains only valid keys and can be copied to a
   test-client machine.
 
-The deliberately small protocol supports one transaction per connection. The
-client sends a newline-terminated request key. A known key returns its binary
-payload, after which the server closes the connection. An empty, oversized, or
-unknown request is closed without a response. Consequently, benchmark results
-include TCP connection establishment and teardown costs.
+The deliberately small protocol accepts newline-terminated request keys. A
+known key returns its binary payload. The server supports keep-alive and up to
+16 pipelined responses per connection; responses are emitted in request order.
+An empty, oversized, unknown, or excessively pipelined request closes the
+connection. The bundled benchmark client still performs one transaction per
+connection and half-closes its write side, so its results include TCP connection
+establishment and teardown costs. This is not HTTP and has no `Content-Length`
+header; a reusable client must already know each expected payload length or add
+an application framing layer.
 
 Client rounds have an intentional completion barrier: all requests in a round
 finish before its consolidated statistics and optional ordered verbose results
@@ -76,6 +81,7 @@ only objective is maximum uninterrupted throughput.
 ## Requirements
 
 - Linux server with a C++23-capable GCC toolchain
+- Boost 1.81 or newer development headers for `boost::unordered_flat_map`
 - Linux or another POSIX client supported by this source
 - Network access from the client to the chosen server TCP port
 - `scp` for copying the key file, or an equivalent file-transfer tool
@@ -315,9 +321,10 @@ their time waiting on a remote network, but should be enabled explicitly after
 measuring CPU use, latency, and failures.
 The first SIGINT or SIGTERM stops submission, discards queued work, allows
 active socket operations to finish within their five-second timeout, and joins
-the workers. A second signal exits immediately. Per-request sockets are not
-reused: doing so would require changing both sides from the current
-half-close/read-until-EOF protocol to explicit request and response framing.
+the workers. A second signal exits immediately. The bundled client does not
+reuse per-request sockets. The server accepts multiple newline-delimited
+requests per socket, but a general reusable client needs explicit response
+framing because payloads are binary and variable-sized.
 
 ## Mapping loaders
 

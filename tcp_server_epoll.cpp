@@ -15,7 +15,6 @@
 #include <mutex>
 #include <atomic>
 #include <condition_variable>
-#include <unordered_map>
 #include <chrono>
 #include <exception>
 #include <fstream>
@@ -25,8 +24,8 @@
 #include <optional>
 #include <span>
 #include <memory>
-#include <queue>
 #include <limits>
+#include <type_traits>
 #include <utility>
 #include <poll.h>
 #include <pthread.h>
@@ -42,7 +41,9 @@
 #include <sys/file.h>
 #include <sys/signalfd.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -54,9 +55,12 @@
 namespace {
 constexpr std::size_t kMaxRequestSize = 1024;
 constexpr std::size_t kAcceptBatchSize = 256;
-constexpr std::size_t kMaxEpollEvents = 256;
+constexpr std::size_t kMaxEpollEvents = 4096;
 constexpr std::size_t kMaxReadBytesPerEvent = 64 * 1024;
 constexpr std::size_t kMaxWriteBytesPerEvent = 64 * 1024;
+constexpr std::size_t kMaxPipelinedResponses = 16;
+constexpr std::size_t kTimingWheelSlots = 256;
+constexpr int kClientReceiveBufferBytes = 4096;
 constexpr auto kDefaultIdleTimeout = std::chrono::seconds(15);
 constexpr auto kEpollWaitTimeout = std::chrono::milliseconds(250);
 constexpr auto kGraceShutdownTimeout = std::chrono::seconds(30);
@@ -73,6 +77,63 @@ std::atomic<std::int64_t> g_drain_deadline_ns{0};
 std::size_t default_event_loop_count() {
     const unsigned int hardware_threads = std::thread::hardware_concurrency();
     return hardware_threads == 0 ? 1U : hardware_threads;
+}
+
+// Pins a worker to one CPU from the process's allowed affinity set. Failure is
+// non-fatal because containers and restricted service managers may forbid it.
+void pin_current_thread(std::size_t worker_index) noexcept {
+    cpu_set_t allowed{};
+    if (::sched_getaffinity(0, sizeof(allowed), &allowed) < 0) {
+        return;
+    }
+    const int allowed_count = CPU_COUNT(&allowed);
+    if (allowed_count <= 0) {
+        return;
+    }
+    const std::size_t target_index = worker_index % static_cast<std::size_t>(allowed_count);
+    std::size_t seen = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        if (seen++ != target_index) {
+            continue;
+        }
+        cpu_set_t target{};
+        CPU_SET(cpu, &target);
+        (void)::pthread_setaffinity_np(::pthread_self(), sizeof(target), &target);
+        return;
+    }
+}
+
+// Rejects configurations that cannot fit their requested sockets in the
+// process descriptor limit, including conservative per-worker overhead.
+void validate_file_descriptor_capacity(std::size_t event_loop_count,
+                                       std::size_t max_connections_per_loop) {
+    if (max_connections_per_loop >
+        (std::numeric_limits<std::size_t>::max() - 32U) / event_loop_count) {
+        throw std::invalid_argument("configured connection capacity overflows size_t");
+    }
+    const std::size_t connections = event_loop_count * max_connections_per_loop;
+    constexpr std::size_t kDescriptorsPerLoop = 4;
+    if (event_loop_count >
+        (std::numeric_limits<std::size_t>::max() - connections - 32U) /
+            kDescriptorsPerLoop) {
+        throw std::invalid_argument("configured descriptor capacity overflows size_t");
+    }
+    const std::size_t required = connections + event_loop_count * kDescriptorsPerLoop + 32U;
+    struct rlimit limit {};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) < 0) {
+        throw std::runtime_error(std::string("getrlimit(RLIMIT_NOFILE) failed: ") +
+                                 std::strerror(errno));
+    }
+    if (limit.rlim_cur != RLIM_INFINITY &&
+        required > static_cast<std::size_t>(limit.rlim_cur)) {
+        throw std::runtime_error(
+            "RLIMIT_NOFILE soft limit " + std::to_string(limit.rlim_cur) +
+            " is below required descriptor capacity " + std::to_string(required) +
+            "; raise ulimit -n or reduce --event-loops/--max-connections-per-loop");
+    }
 }
 
 // Parses a base-10 CLI value; text is the raw input and arg_name labels errors.
@@ -98,7 +159,7 @@ public:
 
     explicit UniqueFd(int fd) noexcept : fd_(fd) {}
 
-    ~UniqueFd() {
+    ~UniqueFd() noexcept {
         reset();
     }
 
@@ -163,23 +224,42 @@ public:
         ::sigaddset(&signals, SIGTERM);
         ::sigaddset(&signals, SIGHUP);
         ::sigaddset(&signals, SIGQUIT);
-        if (::pthread_sigmask(SIG_BLOCK, &signals, nullptr) != 0) {
-            throw std::runtime_error("pthread_sigmask failed while blocking termination signals");
+        const int mask_error =
+            ::pthread_sigmask(SIG_BLOCK, &signals, &previous_mask_);
+        if (mask_error != 0) {
+            throw std::runtime_error(std::string("pthread_sigmask failed while blocking ") +
+                                     "termination signals: " + std::strerror(mask_error));
         }
+        mask_installed_ = true;
         const int signal_fd =
             ::signalfd(-1, &signals, SFD_CLOEXEC | SFD_NONBLOCK);
         if (signal_fd < 0) {
-            throw std::runtime_error(std::string("signalfd failed: ") + std::strerror(errno));
+            const int signal_error = errno;
+            (void)::pthread_sigmask(SIG_SETMASK, &previous_mask_, nullptr);
+            mask_installed_ = false;
+            throw std::runtime_error(std::string("signalfd failed: ") +
+                                     std::strerror(signal_error));
         }
         fd_.reset(signal_fd);
     }
 
+    ~SignalFd() noexcept {
+        fd_.reset();
+        if (mask_installed_) {
+            (void)::pthread_sigmask(SIG_SETMASK, &previous_mask_, nullptr);
+        }
+    }
+
     SignalFd(const SignalFd&) = delete;
     SignalFd& operator=(const SignalFd&) = delete;
+    SignalFd(SignalFd&&) = delete;
+    SignalFd& operator=(SignalFd&&) = delete;
     int fd() const noexcept { return fd_.get(); }
 
 private:
     UniqueFd fd_;
+    sigset_t previous_mask_{};
+    bool mask_installed_ = false;
 };
 
 // Returns the monotonic clock in nanoseconds for lock-free shutdown deadlines.
@@ -687,7 +767,7 @@ public:
         }
     }
 
-    ~MappedRegion() {
+    ~MappedRegion() noexcept {
         if (addr_ != MAP_FAILED) {
             ::munmap(addr_, length_);
         }
@@ -695,6 +775,8 @@ public:
 
     MappedRegion(const MappedRegion&) = delete;
     MappedRegion& operator=(const MappedRegion&) = delete;
+    MappedRegion(MappedRegion&&) = delete;
+    MappedRegion& operator=(MappedRegion&&) = delete;
 
     const std::uint8_t* data() const noexcept {
         return static_cast<const std::uint8_t*>(addr_);
@@ -731,6 +813,11 @@ public:
     void set_mmap_view(MMapViewLoadedData&& loaded) {
         owned_data_.clear();
         owned_data_.rehash(0);
+        // Borrowed keys and payloads must be destroyed before their old mapped
+        // region is released, even though their destructors are currently trivial.
+        mapped_view_data_.clear();
+        mapped_view_data_.rehash(0);
+        mapped_region_.reset();
         mapped_region_ = std::move(loaded.region);
         mapped_view_data_ = std::move(loaded.data);
     }
@@ -1031,31 +1118,94 @@ std::optional<ResponseBufferView> find_client_response(std::string_view request)
     return g_mapping_store.find(request);
 }
 
+// Allocated only for the uncommon case where a client pipelines requests faster
+// than the current response can be written. The fixed ring preserves a strict
+// memory bound without bloating every idle connection.
+struct PipelinedResponseOverflow {
+    static constexpr std::size_t kCapacity = kMaxPipelinedResponses - 1;
+    std::array<ResponseBufferView, kCapacity> responses{};
+    std::size_t head = 0;
+    std::size_t count = 0;
+};
+
 // Holds all per-client state needed for edge-triggered request parsing, partial
-// response writes, and generation-safe idle timeout tracking.
+// response writes, and intrusive idle-timeout tracking.
 struct ConnectionState {
     explicit ConnectionState(UniqueFd socket_value)
-        : socket(std::move(socket_value)) {
-        request_line.reserve(128);
-    }
+        : socket(std::move(socket_value)) {}
 
     [[nodiscard]] int fd() const noexcept { return socket.get(); }
 
     UniqueFd socket;
     std::string request_line;
-    const std::uint8_t* response_data = nullptr;
-    std::size_t response_size = 0;
+    ResponseBufferView response{};
+    std::unique_ptr<PipelinedResponseOverflow> response_overflow;
     std::size_t response_sent = 0;
-    std::uint64_t generation = 0;
-    std::chrono::steady_clock::time_point deadline{};
-    bool response_ready = false;
+    std::uint64_t expiration_tick = 0;
+    int wheel_previous = -1;
+    int wheel_next = -1;
+    std::uint8_t wheel_slot = 0;
+    bool wheel_scheduled = false;
+    bool peer_write_closed = false;
+
+    [[nodiscard]] bool has_responses() const noexcept { return response.size != 0; }
+    [[nodiscard]] bool response_queue_full() const noexcept {
+        return has_responses() && response_overflow != nullptr &&
+               response_overflow->count == PipelinedResponseOverflow::kCapacity;
+    }
+    [[nodiscard]] ResponseBufferView& current_response() noexcept {
+        return response;
+    }
+    [[nodiscard]] bool push_response(ResponseBufferView next_response) noexcept {
+        if (!has_responses()) [[likely]] {
+            response = next_response;
+            return true;
+        }
+        if (response_overflow == nullptr) {
+            try {
+                response_overflow = std::make_unique<PipelinedResponseOverflow>();
+            } catch (const std::bad_alloc&) {
+                return false;
+            }
+        }
+        if (response_overflow->count == PipelinedResponseOverflow::kCapacity) {
+            return false;
+        }
+        const std::size_t tail =
+            (response_overflow->head + response_overflow->count) %
+            PipelinedResponseOverflow::kCapacity;
+        response_overflow->responses[tail] = next_response;
+        ++response_overflow->count;
+        return true;
+    }
+    void pop_response() noexcept {
+        response_sent = 0;
+        if (response_overflow == nullptr || response_overflow->count == 0) [[likely]] {
+            response = {};
+            response_overflow.reset();
+            return;
+        }
+        response = response_overflow->responses[response_overflow->head];
+        response_overflow->head =
+            (response_overflow->head + 1) % PipelinedResponseOverflow::kCapacity;
+        --response_overflow->count;
+        if (response_overflow->count == 0) {
+            response_overflow.reset();
+        }
+    }
 };
 
-// Owns live connections in slots indexed by descriptor, enabling constant-time
-// lookup while rejecting stale references through descriptor checks.
+static_assert(!std::is_copy_constructible_v<ConnectionState>);
+static_assert(!std::is_copy_assignable_v<ConnectionState>);
+static_assert(std::is_nothrow_move_constructible_v<ConnectionState>);
+static_assert(std::is_nothrow_move_assignable_v<ConnectionState>);
+
+// Owns live connections inline in one cache-local open-addressed allocation,
+// avoiding a separate heap node for every accepted descriptor.
 class ConnectionTable {
 public:
-    using Iterator = std::unordered_map<int, ConnectionState>::iterator;
+    using Storage = boost::unordered_flat_map<int, ConnectionState>;
+    using Iterator = Storage::iterator;
     // Takes ownership of socket and creates its state in the descriptor slot.
     ConnectionState& emplace(UniqueFd socket) {
         const int fd = socket.get();
@@ -1111,19 +1261,7 @@ public:
     Iterator erase(Iterator it) noexcept { return entries_.erase(it); }
 
 private:
-    std::unordered_map<int, ConnectionState> entries_;
-};
-
-// Priority-queue record for one connection idle deadline; generation prevents
-// an older record from expiring a connection that has since received activity.
-struct DeadlineEntry {
-    std::chrono::steady_clock::time_point deadline;
-    int fd = -1;
-    std::uint64_t generation = 0;
-
-    bool operator>(const DeadlineEntry& other) const noexcept {
-        return deadline > other.deadline;
-    }
+    Storage entries_;
 };
 
 // Creates the close-on-exec epoll descriptor used by one event-loop worker.
@@ -1217,8 +1355,29 @@ UniqueFd create_reuseport_listener(int listen_port) {
     return listen_socket;
 }
 
+// Applies memory-conscious options to an accepted client socket. Linux doubles
+// SO_RCVBUF internally for bookkeeping, but the requested value still bounds
+// the advertised receive window far below the distribution default.
+void configure_client_socket(int fd) {
+    const int enable = 1;
+    const int receive_buffer = kClientReceiveBufferBytes;
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                     &receive_buffer, sizeof(receive_buffer)) < 0) {
+        throw std::runtime_error(std::string("setsockopt(SO_RCVBUF) failed: ") +
+                                 std::strerror(errno));
+    }
+    if (::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable)) < 0) {
+        throw std::runtime_error(std::string("setsockopt(SO_KEEPALIVE) failed: ") +
+                                 std::strerror(errno));
+    }
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable)) < 0) {
+        throw std::runtime_error(std::string("setsockopt(TCP_NODELAY) failed: ") +
+                                 std::strerror(errno));
+    }
+}
+
 // Linux-specific implementation of one isolated epoll worker, including its
-// listener, wake channel, connection table, and idle-deadline queue.
+// listener, wake channel, connection table, and idle-timeout wheel.
 class EventLoop::Impl {
 public:
     // Builds worker loop_id with a reuse-port listener on listen_port, the
@@ -1236,6 +1395,8 @@ public:
           wake_fd_(create_event_handle()),
           reserve_fd_(open_reserve_fd()) {
         connections_.reserve(max_connections_);
+        timing_wheel_.fill(-1);
+        last_expired_tick_ = current_tick();
         register_fd(listen_socket_.fd(), EPOLLIN);
         listener_registered_ = true;
         register_fd(wake_fd_.fd(), EPOLLIN);
@@ -1437,27 +1598,52 @@ private:
         }
     }
 
-    // Refreshes connection's idle deadline and publishes a new generation entry.
-    void touch(ConnectionState& connection) {
-        connection.deadline = std::chrono::steady_clock::now() + idle_timeout_;
-        ++connection.generation;
-        deadlines_.push(DeadlineEntry{connection.deadline, connection.fd(), connection.generation});
-        compact_deadlines_if_needed();
+    static std::uint64_t current_tick() noexcept {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
-    // Rebuilds the deadline queue when stale generations grow disproportionately.
-    void compact_deadlines_if_needed() {
-        constexpr std::size_t kDeadlineSlack = 256;
-        const std::size_t max_entries = connections_.size() * 2 + kDeadlineSlack;
-        if (deadlines_.size() <= max_entries) {
+    // Removes a connection from its intrusive timing-wheel list in O(1).
+    void unschedule_timeout(ConnectionState& connection) noexcept {
+        if (!connection.wheel_scheduled) {
             return;
         }
-
-        decltype(deadlines_) compacted;
-        for (const auto& [fd, connection] : connections_) {
-            compacted.push(DeadlineEntry{connection.deadline, fd, connection.generation});
+        if (connection.wheel_previous >= 0) {
+            ConnectionState* previous = connections_.find(connection.wheel_previous);
+            if (previous != nullptr) {
+                previous->wheel_next = connection.wheel_next;
+            }
+        } else {
+            timing_wheel_[connection.wheel_slot] = connection.wheel_next;
         }
-        deadlines_.swap(compacted);
+        if (connection.wheel_next >= 0) {
+            ConnectionState* next = connections_.find(connection.wheel_next);
+            if (next != nullptr) {
+                next->wheel_previous = connection.wheel_previous;
+            }
+        }
+        connection.wheel_previous = -1;
+        connection.wheel_next = -1;
+        connection.wheel_scheduled = false;
+    }
+
+    // Refreshes the idle timeout without allocating or leaving stale records.
+    void touch(ConnectionState& connection) noexcept {
+        unschedule_timeout(connection);
+        connection.expiration_tick = current_tick() +
+            static_cast<std::uint64_t>(idle_timeout_.count()) + 1U;
+        connection.wheel_slot = static_cast<std::uint8_t>(
+            connection.expiration_tick % kTimingWheelSlots);
+        connection.wheel_next = timing_wheel_[connection.wheel_slot];
+        if (connection.wheel_next >= 0) {
+            ConnectionState* next = connections_.find(connection.wheel_next);
+            if (next != nullptr) {
+                next->wheel_previous = connection.fd();
+            }
+        }
+        timing_wheel_[connection.wheel_slot] = connection.fd();
+        connection.wheel_scheduled = true;
     }
 
     // Routes one epoll event to wake, accept, read, write, error, or hangup logic.
@@ -1490,9 +1676,11 @@ private:
         }
 
         const bool full_hangup = (event.events & EPOLLHUP) != 0U;
-        const bool peer_write_closed = (event.events & EPOLLRDHUP) != 0U;
+        if ((event.events & EPOLLRDHUP) != 0U) {
+            connection->peer_write_closed = true;
+        }
         bool keep_open = true;
-        if ((event.events & EPOLLIN) != 0U && !connection->response_ready) {
+        if ((event.events & EPOLLIN) != 0U) {
             keep_open = handle_read(*connection);
             connection = connections_.find(event.data.fd);
         }
@@ -1502,8 +1690,8 @@ private:
             return;
         }
 
-        if (connection->response_ready &&
-            (event.events & EPOLLOUT) != 0U) {
+        if (connection->has_responses() &&
+            (((event.events & EPOLLOUT) != 0U) || (event.events & EPOLLIN) != 0U)) {
             keep_open = handle_write(*connection);
         }
 
@@ -1513,11 +1701,26 @@ private:
             return;
         }
 
-        // Read buffered data before honoring HUP/RDHUP. A full hangup cannot
-        // receive a response; a half-close may still read one.
-        if (full_hangup || (peer_write_closed && !connection->response_ready)) {
+        if (full_hangup || (connection->peer_write_closed && !connection->has_responses())) {
+            close_connection(event.data.fd);
+            return;
+        }
+
+        if (!update_connection_interest(*connection)) {
             close_connection(event.data.fd);
         }
+    }
+
+    // Rearms an edge-triggered one-shot client after bounded read/write work.
+    bool update_connection_interest(const ConnectionState& connection) noexcept {
+        std::uint32_t events = EPOLLET | EPOLLONESHOT | EPOLLRDHUP | EPOLLERR;
+        if (!connection.peer_write_closed) {
+            events |= EPOLLIN;
+        }
+        if (connection.has_responses()) {
+            events |= EPOLLOUT;
+        }
+        return try_modify_fd(connection.fd(), events);
     }
 
     // Accepts a bounded batch from the ready listener, registers each client,
@@ -1565,6 +1768,7 @@ private:
             const int client_fd = client_socket.get();
             bool connection_created = false;
             try {
+                configure_client_socket(client_fd);
                 ConnectionState& connection =
                     connections_.emplace(std::move(client_socket));
                 connection_created = true;
@@ -1572,7 +1776,8 @@ private:
                 // Register the socket before publishing its idle deadline.  If epoll
                 // registration fails, the whole connection transaction is rolled back.
                 if (!try_register_connection_fd(
-                        client_fd, EPOLLIN | EPOLLRDHUP | EPOLLERR)) {
+                        client_fd,
+                        EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP | EPOLLERR)) {
                     connections_.erase(client_fd);
                     continue;
                 }
@@ -1607,13 +1812,13 @@ private:
         }
     }
 
-    // Reads a newline-terminated key into connection, resolves its response, and
-    // switches epoll interest to writes; false means the client must close.
+    // Reads bounded newline-delimited requests. Multiple lines may be queued on
+    // one keep-alive connection; the fixed response ring bounds memory usage.
     bool handle_read(ConnectionState& connection) {
         std::array<char, 512> buffer{};
         std::size_t bytes_read = 0;
 
-        while (!connection.response_ready && bytes_read < kMaxReadBytesPerEvent) {
+        while (bytes_read < kMaxReadBytesPerEvent) {
             const std::size_t read_size = std::min(buffer.size(), kMaxReadBytesPerEvent - bytes_read);
             const ssize_t n = ::recv(connection.fd(), buffer.data(), read_size, 0);
             if (n < 0) {
@@ -1627,7 +1832,8 @@ private:
             }
 
             if (n == 0) {
-                return false;
+                connection.peer_write_closed = true;
+                return true;
             }
 
             touch(connection);
@@ -1635,63 +1841,54 @@ private:
             const char* chunk = buffer.data();
             const std::size_t chunk_size = static_cast<std::size_t>(n);
             bytes_read += chunk_size;
-            const void* newline_ptr = std::memchr(chunk, '\n', chunk_size);
-            if (newline_ptr == nullptr) {
-                if (connection.request_line.size() + chunk_size > kMaxRequestSize) {
+            std::size_t consumed = 0;
+            while (consumed < chunk_size) {
+                const void* newline_ptr =
+                    std::memchr(chunk + consumed, '\n', chunk_size - consumed);
+                const std::size_t fragment_size = newline_ptr == nullptr
+                    ? chunk_size - consumed
+                    : static_cast<std::size_t>(static_cast<const char*>(newline_ptr) -
+                                               (chunk + consumed));
+                if (connection.request_line.size() + fragment_size > kMaxRequestSize) {
                     return false;
                 }
-                connection.request_line.append(chunk, chunk_size);
-                continue;
+                connection.request_line.append(chunk + consumed, fragment_size);
+                consumed += fragment_size;
+                if (newline_ptr == nullptr) {
+                    break;
+                }
+                ++consumed;
+                if (!connection.request_line.empty() &&
+                    connection.request_line.back() == '\r') {
+                    connection.request_line.pop_back();
+                }
+                if (connection.request_line.empty() || connection.response_queue_full()) {
+                    return false;
+                }
+                const std::optional<ResponseBufferView> response =
+                    find_client_response(connection.request_line);
+                if (!response.has_value()) {
+                    return false;
+                }
+                if (!connection.push_response(*response)) {
+                    return false;
+                }
+                connection.request_line.clear();
             }
-
-            const char* newline = static_cast<const char*>(newline_ptr);
-            const std::size_t append_size = static_cast<std::size_t>(newline - chunk);
-            if (connection.request_line.size() + append_size > kMaxRequestSize) {
-                return false;
-            }
-
-            // This is deliberately a one-request-per-connection protocol.
-            // Bytes after the first newline are ignored and the connection is
-            // closed after the response. This policy is independent of how TCP
-            // happens to segment the request and prevents request smuggling into
-            // a second logical operation on the same connection.
-            connection.request_line.append(chunk, append_size);
-            if (!connection.request_line.empty() && connection.request_line.back() == '\r') {
-                connection.request_line.pop_back();
-            }
-            if (connection.request_line.empty()) {
-                return false;
-            }
-
-            const std::optional<ResponseBufferView> response =
-                find_client_response(connection.request_line);
-            if (!response.has_value()) {
-                return false;
-            }
-
-            connection.response_data = response->data;
-            connection.response_size = response->size;
-            connection.response_sent = 0;
-            connection.response_ready = true;
-            if (!try_modify_fd(connection.fd(), EPOLLOUT | EPOLLRDHUP | EPOLLERR)) {
-                return false;
-            }
-            return handle_write(connection);
         }
 
         return true;
     }
 
-    // Sends a bounded chunk of connection's response; returns true only while
-    // the connection should remain registered for more output.
+    // Sends queued responses in request order while bounding work per event.
     bool handle_write(ConnectionState& connection) {
         std::size_t bytes_written = 0;
-        while (connection.response_sent < connection.response_size &&
-               bytes_written < kMaxWriteBytesPerEvent) {
-            const std::size_t remaining = connection.response_size - connection.response_sent;
+        while (connection.has_responses() && bytes_written < kMaxWriteBytesPerEvent) {
+            const ResponseBufferView& response = connection.current_response();
+            const std::size_t remaining = response.size - connection.response_sent;
             const std::size_t write_size = std::min(remaining, kMaxWriteBytesPerEvent - bytes_written);
             const ssize_t n = ::send(connection.fd(),
-                                     connection.response_data + connection.response_sent,
+                                     response.data + connection.response_sent,
                                      write_size,
                                      MSG_NOSIGNAL | MSG_DONTWAIT);
             if (n < 0) {
@@ -1709,31 +1906,39 @@ private:
 
             connection.response_sent += static_cast<std::size_t>(n);
             bytes_written += static_cast<std::size_t>(n);
-            touch(connection);
+            // A half-closed peer is closed as soon as its queued responses are
+            // flushed, so moving it within the timing wheel cannot affect its
+            // lifetime and only adds hash lookups on the one-shot hot path.
+            if (!connection.peer_write_closed) {
+                touch(connection);
+            }
+            if (connection.response_sent == response.size) {
+                connection.pop_response();
+            }
         }
 
-        return connection.response_sent < connection.response_size;
+        return true;
     }
 
-    // Closes connections whose current-generation idle deadline has elapsed.
+    // Advances the one-second timing wheel and closes expired connections.
     void expire_idle_connections() {
-        const auto now = std::chrono::steady_clock::now();
-        while (!deadlines_.empty() && deadlines_.top().deadline <= now) {
-            const DeadlineEntry deadline = deadlines_.top();
-            deadlines_.pop();
-
-            ConnectionState* connection = connections_.find(deadline.fd);
-            if (connection == nullptr) {
-                continue;
+        const std::uint64_t now = current_tick();
+        while (last_expired_tick_ < now) {
+            ++last_expired_tick_;
+            const std::size_t slot = static_cast<std::size_t>(
+                last_expired_tick_ % kTimingWheelSlots);
+            int fd = timing_wheel_[slot];
+            while (fd >= 0) {
+                ConnectionState* connection = connections_.find(fd);
+                if (connection == nullptr) {
+                    break;
+                }
+                const int next_fd = connection->wheel_next;
+                if (connection->expiration_tick <= now) {
+                    close_connection(fd);
+                }
+                fd = next_fd;
             }
-            if (connection->generation != deadline.generation) {
-                continue;
-            }
-            if (connection->deadline > now) {
-                continue;
-            }
-
-            close_connection(connection->fd());
         }
     }
 
@@ -1744,6 +1949,7 @@ private:
             return;
         }
 
+        unschedule_timeout(*connection);
         remove_fd(fd);
         connections_.erase(fd);
         ++stats_.closed;
@@ -1771,9 +1977,8 @@ private:
     bool listener_registered_ = false;
     std::chrono::steady_clock::time_point accept_resume_time_{};
     ConnectionTable connections_;
-    std::priority_queue<DeadlineEntry,
-                        std::vector<DeadlineEntry>,
-                        std::greater<DeadlineEntry>> deadlines_;
+    std::array<int, kTimingWheelSlots> timing_wheel_{};
+    std::uint64_t last_expired_tick_ = 0;
 };
 
 // Constructs the public worker facade from its identifier, shared port,
@@ -1857,6 +2062,7 @@ void start_listen(int listen_port,
         for (std::size_t i = 0; i < event_loop_count; ++i) {
             workers.emplace_back([&, i](std::stop_token stop_token) {
                 try {
+                    pin_current_thread(i);
                     event_loops[i]->run(stop_token);
                 } catch (...) {
                     {
@@ -2148,6 +2354,11 @@ int main(int argc, char* argv[]) {
 
         if (has_listen && (listen_port <= 0 || listen_port > 65535)) {
             throw std::invalid_argument("Port must be in range 1..65535");
+        }
+
+        if (has_listen) {
+            validate_file_descriptor_capacity(event_loop_count,
+                                              max_connections_per_loop);
         }
 
         UniqueFd port_instance_lock;
