@@ -21,6 +21,7 @@
 #include <random>
 #include <filesystem>
 #include <array>
+#include <bit>
 #include <optional>
 #include <span>
 #include <memory>
@@ -43,6 +44,7 @@
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/uio.h>
+#include <sys/random.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <unistd.h>
@@ -67,15 +69,10 @@ constexpr auto kEpollWaitTimeout = std::chrono::milliseconds(250);
 constexpr auto kGraceShutdownTimeout = std::chrono::seconds(30);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 constexpr auto kAcceptCapacityBackoff = std::chrono::milliseconds(10);
+constexpr auto kRequestCompletionTimeout = std::chrono::seconds(10);
+constexpr auto kResponseDrainTimeout = std::chrono::seconds(30);
 static_assert(tcp_common::kMaxPayloadSize <=
               static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()));
-static_assert(kMaxPipelinedResponses *
-                  (tcp_common::kMaxPayloadSize + sizeof(std::uint32_t)) <=
-              kMaxWriteBytesPerEvent,
-              "ET writes must drain the entire bounded response queue per event");
-static_assert(kMaxPipelinedResponses * (kMaxRequestSize + 1) <
-              kMaxReadBytesPerEvent,
-              "ET reads must reach EAGAIN or the bounded pipeline limit per event");
 
 // Describes the process-wide transition from accepting traffic, through a
 // graceful drain, to forced worker termination.
@@ -317,16 +314,77 @@ struct ClientResponse {
 struct TransparentStringHash {
     using is_transparent = void;
 
-    std::size_t operator()(std::string_view value) const noexcept {
-        return std::hash<std::string_view>{}(value);
+    static const std::array<std::uint64_t, 2>& secrets() {
+        static const std::array<std::uint64_t, 2> values = [] {
+            std::array<std::uint64_t, 2> random_values{};
+            std::size_t offset = 0;
+            while (offset < sizeof(random_values)) {
+                const ssize_t count = ::getrandom(
+                    reinterpret_cast<std::uint8_t*>(random_values.data()) + offset,
+                    sizeof(random_values) - offset, 0);
+                if (count > 0) {
+                    offset += static_cast<std::size_t>(count);
+                    continue;
+                }
+                if (count < 0 && errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(
+                    std::string("getrandom failed while seeding request hash: ") +
+                    std::strerror(errno));
+            }
+            return random_values;
+        }();
+        return values;
     }
 
-    std::size_t operator()(const std::string& value) const noexcept {
-        return std::hash<std::string_view>{}(value);
+    static void sip_round(std::uint64_t& v0, std::uint64_t& v1,
+                          std::uint64_t& v2, std::uint64_t& v3) noexcept {
+        v0 += v1; v1 = std::rotl(v1, 13); v1 ^= v0; v0 = std::rotl(v0, 32);
+        v2 += v3; v3 = std::rotl(v3, 16); v3 ^= v2;
+        v0 += v3; v3 = std::rotl(v3, 21); v3 ^= v0;
+        v2 += v1; v1 = std::rotl(v1, 17); v1 ^= v2; v2 = std::rotl(v2, 32);
     }
 
-    std::size_t operator()(const char* value) const noexcept {
-        return std::hash<std::string_view>{}(value);
+    std::size_t operator()(std::string_view value) const {
+        const auto& key = secrets();
+        std::uint64_t v0 = 0x736f6d6570736575ULL ^ key[0];
+        std::uint64_t v1 = 0x646f72616e646f6dULL ^ key[1];
+        std::uint64_t v2 = 0x6c7967656e657261ULL ^ key[0];
+        std::uint64_t v3 = 0x7465646279746573ULL ^ key[1];
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(value.data());
+        std::size_t offset = 0;
+        while (value.size() - offset >= sizeof(std::uint64_t)) {
+            std::uint64_t message = 0;
+            std::memcpy(&message, bytes + offset, sizeof(message));
+            if constexpr (std::endian::native == std::endian::big) {
+                message = std::byteswap(message);
+            }
+            v3 ^= message;
+            sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3);
+            v0 ^= message;
+            offset += sizeof(message);
+        }
+        std::uint64_t tail = static_cast<std::uint64_t>(value.size()) << 56U;
+        for (std::size_t i = 0; i < value.size() - offset; ++i) {
+            tail |= static_cast<std::uint64_t>(bytes[offset + i]) << (i * 8U);
+        }
+        v3 ^= tail;
+        sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3);
+        v0 ^= tail;
+        v2 ^= 0xffU;
+        for (int i = 0; i < 4; ++i) {
+            sip_round(v0, v1, v2, v3);
+        }
+        return static_cast<std::size_t>(v0 ^ v1 ^ v2 ^ v3);
+    }
+
+    std::size_t operator()(const std::string& value) const {
+        return (*this)(std::string_view(value));
+    }
+
+    std::size_t operator()(const char* value) const {
+        return (*this)(std::string_view(value));
     }
 };
 
@@ -767,13 +825,26 @@ RequestMap load_mapping_file(const std::string& path) {
     return data;
 }
 
-// Owns a read-only mmap of length bytes from fd and releases it on destruction.
+// Owns an anonymous snapshot populated from fd and made read-only. The mapping
+// has no live dependency on the source inode, so later truncation cannot SIGBUS.
 class MappedRegion {
 public:
     MappedRegion(int fd, std::size_t length) : length_(length) {
-        addr_ = ::mmap(nullptr, length_, PROT_READ, MAP_PRIVATE, fd, 0);
+        addr_ = ::mmap(nullptr, length_, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (addr_ == MAP_FAILED) {
             throw std::runtime_error(std::string("mmap failed: ") + std::strerror(errno));
+        }
+        try {
+            read_exact_fd(fd, addr_, length_, "creating immutable mapping snapshot");
+            if (::mprotect(addr_, length_, PROT_READ) < 0) {
+                throw std::runtime_error(std::string("mprotect failed: ") +
+                                         std::strerror(errno));
+            }
+        } catch (...) {
+            ::munmap(addr_, length_);
+            addr_ = MAP_FAILED;
+            throw;
         }
     }
 
@@ -912,8 +983,8 @@ std::size_t request_mapping_size() {
     return g_mapping_store.size();
 }
 
-// Parses path through mmap but copies keys and payloads into an owned RequestMap
-// before releasing the mapped file.
+// Parses an anonymous read-only snapshot and copies keys and payloads into an
+// owned RequestMap before releasing the snapshot.
 RequestMap load_mapping_file_mmap(const std::string& path) {
     UniqueFd fd = open_locked_mapping_file(path);
 
@@ -1085,12 +1156,10 @@ void initialize_request_mapping(const std::string& path,
         }
 
         if (load_mode == MappingLoadMode::MMapView) {
-            std::cout << "mmap-view requires mapping file immutability while server is running; "
-                         "updates must be done via atomic replace under writer-side exclusive lock."
-                      << std::endl;
             set_mmap_view_mapping_data(load_mapping_file_mmap_view(path));
             std::cout << "Generated mapping file with " << generated_count
-                      << " random entries at " << path << " and loaded using mmap-view"
+                      << " random entries at " << path
+                      << " and loaded using an immutable mmap-view snapshot"
                       << std::endl;
             return;
         }
@@ -1104,12 +1173,9 @@ void initialize_request_mapping(const std::string& path,
     }
 
     if (load_mode == MappingLoadMode::MMapView) {
-        std::cout << "mmap-view requires mapping file immutability while server is running; "
-                     "updates must be done via atomic replace under writer-side exclusive lock."
-                  << std::endl;
         set_mmap_view_mapping_data(load_mapping_file_mmap_view(path));
         std::cout << "Loaded " << request_mapping_size() << " mapping entries from " << path
-                  << " using mmap-view" << std::endl;
+                  << " using an immutable mmap-view snapshot" << std::endl;
         return;
     }
 
@@ -1154,6 +1220,9 @@ struct ConnectionState {
     std::size_t response_header_sent = 0;
     std::size_t response_sent = 0;
     std::uint64_t expiration_tick = 0;
+    std::uint64_t idle_deadline_tick = 0;
+    std::uint64_t request_deadline_tick = 0;
+    std::uint64_t response_deadline_tick = 0;
     int wheel_previous = -1;
     int wheel_next = -1;
     std::uint8_t wheel_slot = 0;
@@ -1655,11 +1724,18 @@ private:
         connection.wheel_scheduled = false;
     }
 
-    // Refreshes the idle timeout without allocating or leaving stale records.
-    void touch(ConnectionState& connection) noexcept {
+    // Tracks the earliest inactivity or absolute protocol-progress deadline.
+    void schedule_timeout(ConnectionState& connection) noexcept {
         unschedule_timeout(connection);
-        connection.expiration_tick = current_tick() +
-            static_cast<std::uint64_t>(idle_timeout_.count()) + 1U;
+        connection.expiration_tick = connection.idle_deadline_tick;
+        if (connection.request_deadline_tick != 0) {
+            connection.expiration_tick = std::min(connection.expiration_tick,
+                                                  connection.request_deadline_tick);
+        }
+        if (connection.response_deadline_tick != 0) {
+            connection.expiration_tick = std::min(connection.expiration_tick,
+                                                  connection.response_deadline_tick);
+        }
         connection.wheel_slot = static_cast<std::uint8_t>(
             connection.expiration_tick % kTimingWheelSlots);
         connection.wheel_next = timing_wheel_[connection.wheel_slot];
@@ -1671,6 +1747,12 @@ private:
         }
         timing_wheel_[connection.wheel_slot] = connection.fd();
         connection.wheel_scheduled = true;
+    }
+
+    void touch(ConnectionState& connection) noexcept {
+        connection.idle_deadline_tick = current_tick() +
+            static_cast<std::uint64_t>(idle_timeout_.count()) + 1U;
+        schedule_timeout(connection);
     }
 
     // Routes one epoll event to wake, accept, read, write, error, or hangup logic.
@@ -1738,11 +1820,10 @@ private:
         }
     }
 
-    // Updates epoll only when read/write interest actually changes. Each
-    // connection belongs to this event-loop thread, so EPOLLONESHOT provides no
-    // synchronization benefit and would require a MOD syscall after every event.
+    // Uses level-triggered readiness so bounded per-event work remains fair and
+    // any unread/unwritten data is reported again without relying on ET sizing.
     bool update_connection_interest(ConnectionState& connection) noexcept {
-        std::uint32_t events = EPOLLET | EPOLLRDHUP | EPOLLERR;
+        std::uint32_t events = EPOLLRDHUP | EPOLLERR;
         if (!connection.peer_write_closed) {
             events |= EPOLLIN;
         }
@@ -1812,7 +1893,7 @@ private:
                 // Register the socket before publishing its idle deadline.  If epoll
                 // registration fails, the whole connection transaction is rolled back.
                 constexpr std::uint32_t initial_events =
-                    EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLERR;
+                    EPOLLIN | EPOLLRDHUP | EPOLLERR;
                 if (!try_register_connection_fd(client_fd, initial_events)) {
                     connections_.erase(client_fd);
                     continue;
@@ -1873,8 +1954,6 @@ private:
                 return true;
             }
 
-            touch(connection);
-
             const char* chunk = buffer.data();
             const std::size_t chunk_size = static_cast<std::size_t>(n);
             bytes_read += chunk_size;
@@ -1888,6 +1967,10 @@ private:
                                                (chunk + consumed));
                 if (connection.request_line.size() + fragment_size > kMaxRequestSize) {
                     return false;
+                }
+                if (fragment_size != 0 && connection.request_deadline_tick == 0) {
+                    connection.request_deadline_tick = current_tick() +
+                        static_cast<std::uint64_t>(kRequestCompletionTimeout.count()) + 1U;
                 }
                 connection.request_line.append(chunk + consumed, fragment_size);
                 consumed += fragment_size;
@@ -1907,11 +1990,18 @@ private:
                 if (!response.has_value()) {
                     return false;
                 }
+                const bool starting_response = !connection.has_responses();
                 if (!connection.push_response(*response)) {
                     return false;
                 }
+                if (starting_response) {
+                    connection.response_deadline_tick = current_tick() +
+                        static_cast<std::uint64_t>(kResponseDrainTimeout.count()) + 1U;
+                }
                 connection.request_line.clear();
+                connection.request_deadline_tick = 0;
             }
+            touch(connection);
         }
 
         return true;
@@ -1972,15 +2062,17 @@ private:
             connection.response_header_sent += header_sent;
             connection.response_sent += sent - header_sent;
             bytes_written += sent;
-            // A half-closed peer is closed as soon as its queued responses are
-            // flushed, so moving it within the timing wheel cannot affect its
-            // lifetime and only adds hash lookups on the write hot path.
-            if (!connection.peer_write_closed) {
-                touch(connection);
-            }
             if (connection.response_header_sent == connection.response_header.size() &&
                 connection.response_sent == response.size) {
                 connection.pop_response();
+                if (!connection.has_responses()) {
+                    connection.response_deadline_tick = 0;
+                }
+            }
+            // Progress refreshes inactivity only. The absolute response deadline
+            // prevents a slow reader from retaining this connection indefinitely.
+            if (!connection.peer_write_closed) {
+                touch(connection);
             }
         }
 

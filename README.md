@@ -44,13 +44,14 @@ The main components are:
 
 - `tcp_server_epoll` uses one `epoll` event loop per worker thread.
 - Each server worker owns a `SO_REUSEPORT` listening socket, its active
-  connection states, and its allocation-free idle-timeout wheel. Connections
-  use edge-triggered notifications and remain assigned to one event loop for
-  their lifetime. Epoll interest is modified only when read/write interest
-  actually changes, avoiding a rearm syscall for each request.
+  connection states, and its allocation-free timeout wheel. Connections use
+  level-triggered notifications and remain assigned to one event loop for their
+  lifetime. Bounded work per event provides fairness without risking an
+  edge-triggered stall when configuration limits change.
 - The server loads `server_request_response_mapping.bin` once at startup. The
-  default `mmap-view` loader indexes keys and keeps response views in the mapped
-  file, avoiding duplicate user-space payload storage.
+  default `mmap-view` loader indexes keys and keeps response views in a
+  read-only anonymous snapshot, avoiding per-payload allocations without
+  retaining a vulnerable file-backed mapping.
 - `tcp_client` opens one persistent connection per worker and reports success, throughput,
   response bandwidth, and categorized connection failures. It creates a fixed
   worker-thread set once, feeds it through a bounded condition-variable queue,
@@ -329,14 +330,14 @@ immediately.
 ## Mapping loaders
 
 - `ifstream`: copies all keys and payloads into owned memory.
-- `mmap`: parses with `mmap` but copies entries into owned memory.
-- `mmap-view`: keeps validated views into the mapped file and has the lowest
-  copying and memory overhead.
+- `mmap`: reads the file into an anonymous mapping, marks it read-only, parses
+  it, and copies entries into owned containers.
+- `mmap-view`: reads the file into an anonymous mapping, marks it read-only,
+  and keeps validated key/payload views into that immutable snapshot.
 
-While `mmap-view` is active, never truncate or modify the mapped inode. Generate
-a complete replacement file and atomically rename it, or stop the server before
-regenerating. Regenerate and re-export keys together; keys from another mapping
-produce zero-byte responses.
+Neither mmap mode retains a live file-backed mapping, so truncating or replacing
+the source file after startup cannot cause `SIGBUS` or mutate active views.
+Regenerate and re-export keys together; keys from another mapping are rejected.
 
 ## Security and scope
 
@@ -345,6 +346,10 @@ protocol. It has no TLS, authentication, authorization, request-level error
 response, or application rate limiting. Run it only on a trusted network or
 behind a secured proxy/load balancer. Restrict firewall access to designated
 test clients.
+
+Request lookup uses process-randomized SipHash. Partial request lines must be
+completed within 10 seconds, and queued responses must drain within 30 seconds;
+ordinary socket activity cannot extend those absolute progress deadlines.
 
 The client validates response size but does not verify payload contents. A
 content-integrity test would require a manifest containing each key's expected
