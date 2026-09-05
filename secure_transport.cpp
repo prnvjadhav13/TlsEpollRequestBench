@@ -98,6 +98,7 @@ void load_crl(SSL_CTX* context, const std::string& crl_file) {
 struct PrivateKeyPrompt {
     std::string text;
     const PrivateKeyPassphrase* passphrase = nullptr;
+    bool allow_interactive = true;
 };
 
 int private_key_password_callback(char* buffer,
@@ -111,6 +112,9 @@ int private_key_password_callback(char* buffer,
     if (prompt->passphrase != nullptr) {
         return prompt->passphrase->copy_to(buffer, buffer_size);
     }
+    if (!prompt->allow_interactive) {
+        return -1;
+    }
     if (EVP_read_pw_string(buffer, buffer_size, prompt->text.c_str(), 0) != 0) {
         return -1;
     }
@@ -121,7 +125,8 @@ void load_identity(SSL_CTX* context,
                    const std::string& certificate_chain_file,
                    const std::string& private_key_file,
                    std::string_view identity_role,
-                   const std::shared_ptr<const PrivateKeyPassphrase>& passphrase) {
+                   const std::shared_ptr<const PrivateKeyPassphrase>& passphrase,
+                   bool allow_interactive_prompt) {
     require(!certificate_chain_file.empty(), "certificate-chain path is empty");
     require(!private_key_file.empty(), "private-key path is empty");
     require(SSL_CTX_use_certificate_chain_file(context,
@@ -130,7 +135,8 @@ void load_identity(SSL_CTX* context,
     PrivateKeyPrompt prompt{
         "Enter " + std::string(identity_role) + " private-key passphrase for " +
         private_key_file + ":",
-        passphrase.get()};
+        passphrase.get(),
+        allow_interactive_prompt};
     SSL_CTX_set_default_passwd_cb(context, private_key_password_callback);
     SSL_CTX_set_default_passwd_cb_userdata(context, &prompt);
     const int key_load_result = SSL_CTX_use_PrivateKey_file(context,
@@ -139,6 +145,12 @@ void load_identity(SSL_CTX* context,
     // The prompt is stack-owned and is needed only while loading this key.
     SSL_CTX_set_default_passwd_cb(context, nullptr);
     SSL_CTX_set_default_passwd_cb_userdata(context, nullptr);
+    if (key_load_result != 1 && passphrase == nullptr && !allow_interactive_prompt) {
+        throw std::runtime_error(
+            drain_error_queue("load " + std::string(identity_role) +
+                " private key noninteractively; encrypted keys require "
+                "--tls-key-passphrase-file for reload"));
+    }
     require(key_load_result == 1, "load " + std::string(identity_role) + " private key");
     require(SSL_CTX_check_private_key(context) == 1,
             "verify certificate/private-key match");
@@ -334,7 +346,8 @@ std::shared_ptr<TlsContext> TlsContext::make_server(const ServerTlsConfig& confi
     ContextPtr guard(raw);
     configure_common(raw, config.version_policy);
     load_identity(raw, config.certificate_chain_file, config.private_key_file, "SERVER",
-                  config.private_key_passphrase);
+                  config.private_key_passphrase,
+                  config.allow_interactive_private_key_prompt);
     require(!config.client_ca_file.empty(), "client-CA path is empty");
     require(SSL_CTX_load_verify_locations(raw, config.client_ca_file.c_str(), nullptr) == 1,
             "load trusted client CA");
@@ -361,7 +374,8 @@ std::shared_ptr<TlsContext> TlsContext::make_client(const ClientTlsConfig& confi
     ContextPtr guard(raw);
     configure_common(raw, config.version_policy);
     load_identity(raw, config.certificate_chain_file, config.private_key_file, "CLIENT",
-                  config.private_key_passphrase);
+                  config.private_key_passphrase,
+                  config.allow_interactive_private_key_prompt);
     require(!config.server_ca_file.empty(), "server-CA path is empty");
     require(SSL_CTX_load_verify_locations(raw, config.server_ca_file.c_str(), nullptr) == 1,
             "load trusted server CA");

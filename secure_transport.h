@@ -61,6 +61,9 @@ struct ServerTlsConfig {
     std::vector<std::string> allowed_client_sans;
     std::shared_ptr<const PrivateKeyPassphrase> private_key_passphrase;
     TlsVersionPolicy version_policy = TlsVersionPolicy::Tls13Only;
+    // Interactive prompting is suitable only for foreground startup. Reload
+    // paths must disable it so the coordinator can never block on a terminal.
+    bool allow_interactive_private_key_prompt = true;
 };
 
 struct ClientTlsConfig {
@@ -71,6 +74,7 @@ struct ClientTlsConfig {
     std::string server_crl_file;
     std::shared_ptr<const PrivateKeyPassphrase> private_key_passphrase;
     TlsVersionPolicy version_policy = TlsVersionPolicy::Tls13Only;
+    bool allow_interactive_private_key_prompt = true;
 };
 
 class TlsContext {

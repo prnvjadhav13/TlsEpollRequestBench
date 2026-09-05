@@ -1,13 +1,17 @@
 # TlsEpollRequestBench
 
 TlsEpollRequestBench is a C++23/Linux systems-programming project for learning
-how to add production-oriented TLS protection to a scalable nonblocking TCP
-data path. It combines an `epoll`-based server, bounded event-loop and worker
+how to add production-oriented TLS protection to a scalable, nonblocking TCP
+data path. It is designed as a practical reference and reusable starting point
+that could be extended for a future business-critical service whose
+authenticated clients connect across a LAN, WAN, or the Internet.
+The project combines an `epoll`-based server, bounded event-loop and worker
 architectures, an OpenSSL transport layer, and a concurrent benchmark client
-that can run on the same host or across a LAN/WAN. The same application protocol
-can run over mutually authenticated TLS or explicit plaintext TCP, allowing the
-security, latency, throughput, CPU, and connection-management costs of the two
-transport modes to be studied with comparable application workloads.
+that can run on the same host or on a separate machine. The same application
+protocol can run over mutually authenticated TLS or explicit plaintext TCP,
+allowing the security, latency, throughput, CPU, and connection-management
+costs of both transport modes to be measured with comparable application
+workloads.
 
 ## Purpose
 
@@ -53,6 +57,38 @@ security. Application authorization, rate limiting, audit integration, key and
 certificate lifecycle automation, operating-system hardening, dependency
 patching, monitoring, and deployment-specific threat controls remain the
 operator's responsibility.
+
+## Practical future use
+
+It is practical to reuse the transport and event-loop architecture for another
+service. A future application can implement `ProtocolFactory` and
+`ProtocolConnection` to replace the included request-to-response mapping logic
+while retaining the nonblocking sockets, `epoll` workers, TLS state machine,
+connection limits, deadlines, graceful shutdown, and certificate reload path.
+CPU-intensive or blocking business logic can use the bounded executor and
+generation-checked completion queue rather than blocking an event-loop thread.
+
+This separation makes the project a useful foundation, not a drop-in production
+platform. Before carrying customer or business-critical traffic, an adopter
+would still need to add and validate the capabilities required by its service,
+including:
+
+- an application protocol with versioning, structured errors, input validation,
+  request identifiers, and compatibility rules;
+- identity-to-permission authorization, tenant isolation, quotas, and rate
+  limiting above the existing mTLS client identity check;
+- production PKI integration, automated enrollment and rotation, revocation or
+  OCSP policy, and secret-manager, TPM, or HSM-backed key handling;
+- service supervision, structured audit and operational logs, metrics, tracing,
+  health checks, alerting, and safe configuration rollout and rollback;
+- deployment hardening, firewall and network policy, dependency and operating
+  system patching, backup and recovery procedures, and capacity planning; and
+- protocol fuzzing, sustained and failure-injection tests, external security
+  review, and workload-specific latency and throughput qualification.
+
+Those additions are feasible without replacing the core TCP/TLS event-loop
+model, but their design depends on the target application's threat model,
+availability objectives, data sensitivity, and regulatory requirements.
 
 ## High-level design
 
@@ -206,7 +242,11 @@ CRL, or allowlist files. A complete new TLS context is validated and published
 for new connections; existing connections retain their original context. A
 failed reload leaves the last known-good context active. When
 `--tls-key-passphrase-file` is configured, reload securely rereads that credential
-file together with the key and does not block waiting for a terminal prompt.
+file together with the key. Reload never requests an interactive passphrase: if
+the replacement key is encrypted and no credential file was configured, reload
+fails immediately and retains the last known-good context. This keeps the
+coordinator responsive to shutdown and later reload signals under systemd,
+containers, and other unattended environments.
 
 Session tickets, session caching, TLS 1.3 PSK-only resumption, and TLS 1.3 0-RTT
 are disabled. Every TCP reconnect performs a new certificate-verified mTLS
@@ -730,7 +770,13 @@ The `mmap-view` server avoids an additional application payload copy when the
 plaintext path passes mapping-backed slices to `sendmsg`. This is not end-to-end
 zero-copy: the anonymous snapshot is populated once at startup, request framing
 uses connection memory, the client receives into a vector, and TLS necessarily
-encrypts plaintext through OpenSSL record buffers.
+encrypts plaintext through OpenSSL record buffers. For TLS responses, the
+four-byte framing header and payload are copied into lazily allocated,
+per-connection coalescing storage and passed to one `SSL_write_ex` call. This
+avoids creating a separate TLS record for the header; the storage remains stable
+across OpenSSL retry states and adds only one pointer to the inline connection
+state. Once a connection sends a response, it retains approximately 4 KB of
+heap capacity for reuse so later responses do not allocate in the data path.
 
 ## Security and scope
 

@@ -1393,6 +1393,13 @@ public:
 
 enum class TlsRetryOperation : std::uint8_t { None, Read, Write };
 
+// Lazily allocated only for TLS connections that need to combine multiple
+// application slices into one SSL_write_ex call. The bytes remain unchanged
+// across WANT_READ/WANT_WRITE retries, as required by OpenSSL.
+struct TlsCoalescedWrite {
+    std::vector<std::byte> bytes;
+};
+
 // Holds transport, injected protocol, TLS retry, and timeout state for one
 // client. Application parsing and response construction live behind protocol.
 struct ConnectionState {
@@ -1436,6 +1443,7 @@ struct ConnectionState {
     std::uint32_t registered_events = 0;
     bool buffered_tls_read_queued = false;
     std::shared_ptr<const void> output_lifetime;
+    std::unique_ptr<TlsCoalescedWrite> tls_coalesced_write;
 
     [[nodiscard]] bool has_responses() const noexcept { return protocol->has_output(); }
 };
@@ -2359,9 +2367,10 @@ private:
                 connection.output_lifetime = output.lifetime;
             }
 
-            // A single vectored write normally emits the framing header and payload
-            // together. This preserves zero-copy views into the immutable mapping
-            // while avoiding a syscall and a small TCP segment per response.
+            // Plain TCP uses both slices directly with sendmsg. TLS has no writev
+            // API, so multiple slices are copied into lazy per-connection storage
+            // and encrypted with one SSL_write_ex call. That storage is retained
+            // unchanged if OpenSSL asks us to retry the write.
             std::array<iovec, 2> vectors{};
             int vector_count = 0;
             std::size_t remaining_budget = budget;
@@ -2385,9 +2394,45 @@ private:
             message.msg_iovlen = static_cast<std::size_t>(vector_count);
             ssize_t n = 0;
             if (connection.tls) {
-                const std::size_t tls_size = vectors[0].iov_len;
-                const auto result = connection.tls->write(std::span<const std::byte>(
-                    static_cast<const std::byte*>(vectors[0].iov_base), tls_size));
+                std::span<const std::byte> tls_input;
+                if (connection.tls_coalesced_write != nullptr &&
+                    !connection.tls_coalesced_write->bytes.empty()) {
+                    tls_input = connection.tls_coalesced_write->bytes;
+                } else if (vector_count > 1) {
+                    try {
+                        if (connection.tls_coalesced_write == nullptr) {
+                            connection.tls_coalesced_write =
+                                std::make_unique<TlsCoalescedWrite>();
+                            connection.tls_coalesced_write->bytes.reserve(
+                                sizeof(std::uint32_t) + tcp_common::kMaxPayloadSize);
+                        }
+                        auto& combined = connection.tls_coalesced_write->bytes;
+                        std::size_t combined_size = 0;
+                        for (int i = 0; i < vector_count; ++i) {
+                            combined_size += vectors[static_cast<std::size_t>(i)].iov_len;
+                        }
+                        combined.resize(combined_size);
+                        std::size_t offset = 0;
+                        for (int i = 0; i < vector_count; ++i) {
+                            const iovec& vector = vectors[static_cast<std::size_t>(i)];
+                            std::memcpy(combined.data() + offset,
+                                        vector.iov_base,
+                                        vector.iov_len);
+                            offset += vector.iov_len;
+                        }
+                        tls_input = combined;
+                    } catch (const std::bad_alloc&) {
+                        return false;
+                    }
+                } else {
+                    tls_input = std::span<const std::byte>(
+                        static_cast<const std::byte*>(vectors[0].iov_base),
+                        vectors[0].iov_len);
+                }
+                const bool used_coalesced_buffer =
+                    connection.tls_coalesced_write != nullptr &&
+                    !connection.tls_coalesced_write->bytes.empty();
+                const auto result = connection.tls->write(tls_input);
                 if (result.status == secure_transport::IoStatus::WantRead) {
                     connection.tls_wants_write = false;
                     connection.tls_retry_operation = TlsRetryOperation::Write;
@@ -2406,6 +2451,9 @@ private:
                 connection.tls_wants_write = false;
                 connection.tls_retry_operation = TlsRetryOperation::None;
                 n = static_cast<ssize_t>(result.bytes);
+                if (used_coalesced_buffer) {
+                    connection.tls_coalesced_write->bytes.clear();
+                }
             } else {
                 n = ::sendmsg(connection.fd(),
                               &message,
@@ -2694,6 +2742,7 @@ void start_listen(int listen_port,
                             if (transport_mode == secure_transport::Mode::Tls && tls_contexts) {
                                 try {
                                     secure_transport::ServerTlsConfig reload_config = tls_config;
+                                    reload_config.allow_interactive_private_key_prompt = false;
                                     if (!tls_key_passphrase_file.empty()) {
                                         reload_config.private_key_passphrase =
                                             secure_transport::load_private_key_passphrase_file(
