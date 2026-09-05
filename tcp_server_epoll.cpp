@@ -12,6 +12,7 @@
 #include <cstring>
 #include <csignal>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include <atomic>
 #include <condition_variable>
@@ -54,6 +55,8 @@
 
 #include "tcp_common_config.h"
 #include "tcp_server_epoll.h"
+#include "secure_transport.h"
+#include "epoll_runtime/connection_id.h"
 
 namespace {
 constexpr std::size_t kMaxRequestSize = 1024;
@@ -61,6 +64,7 @@ constexpr std::size_t kAcceptBatchSize = 256;
 constexpr std::size_t kMaxEpollEvents = 4096;
 constexpr std::size_t kMaxReadBytesPerEvent = 64 * 1024;
 constexpr std::size_t kMaxWriteBytesPerEvent = 64 * 1024;
+constexpr std::size_t kMaxDeferredTlsReadsPerIteration = 256;
 constexpr std::size_t kMaxPipelinedResponses = 16;
 constexpr std::size_t kTimingWheelSlots = 256;
 constexpr int kClientReceiveBufferBytes = 4096;
@@ -71,6 +75,9 @@ constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 constexpr auto kAcceptCapacityBackoff = std::chrono::milliseconds(10);
 constexpr auto kRequestCompletionTimeout = std::chrono::seconds(10);
 constexpr auto kResponseDrainTimeout = std::chrono::seconds(30);
+constexpr auto kTlsHandshakeTimeout = std::chrono::seconds(10);
+constexpr std::size_t kMaxTlsHandshakesPerLoop = 1024;
+constexpr std::size_t kMaxTlsErrorLogsPerLoop = 20;
 static_assert(tcp_common::kMaxPayloadSize <=
               static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()));
 
@@ -156,6 +163,32 @@ int parse_int_arg(const char* text, const char* arg_name) {
     } catch (const std::exception&) {
         throw std::invalid_argument(std::string(arg_name) + " must be a valid integer");
     }
+}
+
+std::vector<std::string> load_tls_client_allowlist(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open TLS client SAN allowlist: " + path);
+    }
+    std::vector<std::string> identities;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line.front() == '#') continue;
+        if (line.size() > 2048 ||
+            (line.rfind("URI:", 0) != 0 && line.rfind("DNS:", 0) != 0)) {
+            throw std::runtime_error(
+                "TLS client allowlist entries must be URI:<value> or DNS:<value>");
+        }
+        identities.push_back(std::move(line));
+        if (identities.size() > 100000) {
+            throw std::runtime_error("TLS client SAN allowlist has too many entries");
+        }
+    }
+    if (!input.eof() || identities.empty()) {
+        throw std::runtime_error("TLS client SAN allowlist is empty or unreadable: " + path);
+    }
+    return identities;
 }
 
 // Move-only RAII owner for a Linux file descriptor; it closes the descriptor
@@ -1204,21 +1237,193 @@ struct PipelinedResponseOverflow {
     std::size_t count = 0;
 };
 
-// Holds all per-client state needed for edge-triggered request parsing, partial
-// response writes, and intrusive idle-timeout tracking.
+// Implements the benchmark's newline request framing and mapping lookup behind
+// the generic per-connection protocol contract consumed by EventLoop.
+class MappingProtocolConnection final : public server_runtime::ProtocolConnection {
+public:
+    [[nodiscard]] bool consume(std::span<const std::byte> input) override {
+        const char* chunk = reinterpret_cast<const char*>(input.data());
+        std::size_t consumed = 0;
+        while (consumed < input.size()) {
+            const void* newline_ptr =
+                std::memchr(chunk + consumed, '\n', input.size() - consumed);
+            const std::size_t fragment_size = newline_ptr == nullptr
+                ? input.size() - consumed
+                : static_cast<std::size_t>(static_cast<const char*>(newline_ptr) -
+                                           (chunk + consumed));
+            if (request_line_.size() + fragment_size > kMaxRequestSize) {
+                return false;
+            }
+            request_line_.append(chunk + consumed, fragment_size);
+            consumed += fragment_size;
+            if (newline_ptr == nullptr) {
+                break;
+            }
+            ++consumed;
+            if (!request_line_.empty() && request_line_.back() == '\r') {
+                request_line_.pop_back();
+            }
+            if (request_line_.empty() || response_queue_full()) {
+                return false;
+            }
+            const std::optional<ResponseBufferView> response =
+                find_client_response(request_line_);
+            if (!response.has_value() || !push_response(*response)) {
+                return false;
+            }
+            request_line_.clear();
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool has_partial_input() const noexcept override {
+        return !request_line_.empty();
+    }
+
+    [[nodiscard]] bool has_output() const noexcept override {
+        return response_.size != 0;
+    }
+
+    [[nodiscard]] server_runtime::OutputBatch output() const noexcept override {
+        server_runtime::OutputBatch batch;
+        if (!has_output()) {
+            return batch;
+        }
+        const std::size_t header_remaining = response_header_.size() - response_header_sent_;
+        if (header_remaining != 0) {
+            batch.slices[batch.count++] = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(response_header_.data() +
+                                                   response_header_sent_),
+                header_remaining);
+        }
+        const std::size_t payload_remaining = response_.size - response_sent_;
+        if (payload_remaining != 0) {
+            batch.slices[batch.count++] = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(response_.data + response_sent_),
+                payload_remaining);
+        }
+        return batch;
+    }
+
+    void consume_output(std::size_t bytes) noexcept override {
+        const std::size_t header_remaining = response_header_.size() - response_header_sent_;
+        const std::size_t header_bytes = std::min(bytes, header_remaining);
+        response_header_sent_ += header_bytes;
+        response_sent_ += bytes - header_bytes;
+        if (response_header_sent_ == response_header_.size() &&
+            response_sent_ == response_.size) {
+            pop_response();
+        }
+    }
+
+private:
+    [[nodiscard]] bool response_queue_full() const noexcept {
+        return has_output() && response_overflow_ != nullptr &&
+               response_overflow_->count == PipelinedResponseOverflow::kCapacity;
+    }
+
+    void set_current_response(ResponseBufferView next_response) noexcept {
+        response_ = next_response;
+        const auto size = static_cast<std::uint32_t>(next_response.size);
+        response_header_ = {
+            static_cast<std::uint8_t>(size >> 24U),
+            static_cast<std::uint8_t>(size >> 16U),
+            static_cast<std::uint8_t>(size >> 8U),
+            static_cast<std::uint8_t>(size)};
+        response_header_sent_ = 0;
+        response_sent_ = 0;
+    }
+
+    [[nodiscard]] bool push_response(ResponseBufferView next_response) noexcept {
+        if (!has_output()) [[likely]] {
+            set_current_response(next_response);
+            return true;
+        }
+        if (response_overflow_ == nullptr) {
+            try {
+                response_overflow_ = std::make_unique<PipelinedResponseOverflow>();
+            } catch (const std::bad_alloc&) {
+                return false;
+            }
+        }
+        if (response_overflow_->count == PipelinedResponseOverflow::kCapacity) {
+            return false;
+        }
+        const std::size_t tail =
+            (response_overflow_->head + response_overflow_->count) %
+            PipelinedResponseOverflow::kCapacity;
+        response_overflow_->responses[tail] = next_response;
+        ++response_overflow_->count;
+        return true;
+    }
+
+    void pop_response() noexcept {
+        if (response_overflow_ == nullptr || response_overflow_->count == 0) [[likely]] {
+            response_ = {};
+            response_header_sent_ = 0;
+            response_sent_ = 0;
+            response_overflow_.reset();
+            return;
+        }
+        const ResponseBufferView next_response =
+            response_overflow_->responses[response_overflow_->head];
+        response_overflow_->head =
+            (response_overflow_->head + 1) % PipelinedResponseOverflow::kCapacity;
+        --response_overflow_->count;
+        if (response_overflow_->count == 0) {
+            response_overflow_.reset();
+        }
+        set_current_response(next_response);
+    }
+
+    std::string request_line_;
+    ResponseBufferView response_{};
+    std::array<std::uint8_t, sizeof(std::uint32_t)> response_header_{};
+    std::unique_ptr<PipelinedResponseOverflow> response_overflow_;
+    std::size_t response_header_sent_ = 0;
+    std::size_t response_sent_ = 0;
+};
+
+class MappingProtocolFactory final : public server_runtime::ProtocolFactory {
+public:
+    [[nodiscard]] std::unique_ptr<server_runtime::ProtocolConnection> create() const override {
+        return std::make_unique<MappingProtocolConnection>();
+    }
+};
+
+enum class TlsRetryOperation : std::uint8_t { None, Read, Write };
+
+// Holds transport, injected protocol, TLS retry, and timeout state for one
+// client. Application parsing and response construction live behind protocol.
 struct ConnectionState {
-    explicit ConnectionState(UniqueFd socket_value)
-        : socket(std::move(socket_value)) {}
+    ConnectionState(UniqueFd socket_value,
+                    std::uint32_t generation_value,
+                    secure_transport::Mode mode,
+                    std::shared_ptr<secure_transport::TlsContext> tls_context,
+                    const server_runtime::ProtocolFactory& protocol_factory)
+        : socket(std::move(socket_value)), generation(generation_value),
+          protocol(protocol_factory.create()) {
+        if (protocol == nullptr) {
+            throw std::runtime_error("protocol factory returned a null connection");
+        }
+        if (mode == secure_transport::Mode::Tls) {
+            tls = std::make_unique<secure_transport::TlsSession>(
+                std::move(tls_context), socket.fd(), true);
+            tls_established = false;
+        }
+    }
 
     [[nodiscard]] int fd() const noexcept { return socket.get(); }
 
     UniqueFd socket;
-    std::string request_line;
-    ResponseBufferView response{};
-    std::array<std::uint8_t, sizeof(std::uint32_t)> response_header{};
-    std::unique_ptr<PipelinedResponseOverflow> response_overflow;
-    std::size_t response_header_sent = 0;
-    std::size_t response_sent = 0;
+    std::uint32_t generation = 0;
+    std::unique_ptr<secure_transport::TlsSession> tls;
+    std::unique_ptr<server_runtime::ProtocolConnection> protocol;
+    bool tls_established = true;
+    bool tls_wants_write = false;
+    bool tls_handshake_counted = false;
+    TlsRetryOperation tls_retry_operation = TlsRetryOperation::None;
+    std::uint64_t tls_handshake_deadline_tick = 0;
     std::uint64_t expiration_tick = 0;
     std::uint64_t idle_deadline_tick = 0;
     std::uint64_t request_deadline_tick = 0;
@@ -1229,66 +1434,10 @@ struct ConnectionState {
     bool wheel_scheduled = false;
     bool peer_write_closed = false;
     std::uint32_t registered_events = 0;
+    bool buffered_tls_read_queued = false;
+    std::shared_ptr<const void> output_lifetime;
 
-    [[nodiscard]] bool has_responses() const noexcept { return response.size != 0; }
-    [[nodiscard]] bool response_queue_full() const noexcept {
-        return has_responses() && response_overflow != nullptr &&
-               response_overflow->count == PipelinedResponseOverflow::kCapacity;
-    }
-    [[nodiscard]] ResponseBufferView& current_response() noexcept {
-        return response;
-    }
-    void set_current_response(ResponseBufferView next_response) noexcept {
-        response = next_response;
-        const auto size = static_cast<std::uint32_t>(next_response.size);
-        response_header = {
-            static_cast<std::uint8_t>(size >> 24U),
-            static_cast<std::uint8_t>(size >> 16U),
-            static_cast<std::uint8_t>(size >> 8U),
-            static_cast<std::uint8_t>(size)};
-        response_header_sent = 0;
-        response_sent = 0;
-    }
-    [[nodiscard]] bool push_response(ResponseBufferView next_response) noexcept {
-        if (!has_responses()) [[likely]] {
-            set_current_response(next_response);
-            return true;
-        }
-        if (response_overflow == nullptr) {
-            try {
-                response_overflow = std::make_unique<PipelinedResponseOverflow>();
-            } catch (const std::bad_alloc&) {
-                return false;
-            }
-        }
-        if (response_overflow->count == PipelinedResponseOverflow::kCapacity) {
-            return false;
-        }
-        const std::size_t tail =
-            (response_overflow->head + response_overflow->count) %
-            PipelinedResponseOverflow::kCapacity;
-        response_overflow->responses[tail] = next_response;
-        ++response_overflow->count;
-        return true;
-    }
-    void pop_response() noexcept {
-        if (response_overflow == nullptr || response_overflow->count == 0) [[likely]] {
-            response = {};
-            response_header_sent = 0;
-            response_sent = 0;
-            response_overflow.reset();
-            return;
-        }
-        const ResponseBufferView next_response =
-            response_overflow->responses[response_overflow->head];
-        response_overflow->head =
-            (response_overflow->head + 1) % PipelinedResponseOverflow::kCapacity;
-        --response_overflow->count;
-        if (response_overflow->count == 0) {
-            response_overflow.reset();
-        }
-        set_current_response(next_response);
-    }
+    [[nodiscard]] bool has_responses() const noexcept { return protocol->has_output(); }
 };
 
 static_assert(!std::is_copy_constructible_v<ConnectionState>);
@@ -1303,12 +1452,17 @@ public:
     using Storage = boost::unordered_flat_map<int, ConnectionState>;
     using Iterator = Storage::iterator;
     // Takes ownership of socket and creates its state in the descriptor slot.
-    ConnectionState& emplace(UniqueFd socket) {
+    ConnectionState& emplace(UniqueFd socket,
+                             std::uint32_t generation,
+                             secure_transport::Mode mode,
+                             std::shared_ptr<secure_transport::TlsContext> tls_context,
+                             const server_runtime::ProtocolFactory& protocol_factory) {
         const int fd = socket.get();
         if (fd < 0) {
             throw std::runtime_error("cannot store negative file descriptor");
         }
-        auto [it, inserted] = entries_.try_emplace(fd, std::move(socket));
+        auto [it, inserted] = entries_.try_emplace(
+            fd, std::move(socket), generation, mode, std::move(tls_context), protocol_factory);
         if (!inserted) {
             throw std::runtime_error("duplicate connection state for fd " + std::to_string(fd));
         }
@@ -1481,15 +1635,24 @@ public:
     Impl(std::size_t loop_id,
          int listen_port,
          std::chrono::seconds idle_timeout,
-         std::size_t max_connections)
+         std::size_t max_connections,
+         secure_transport::Mode transport_mode,
+         std::shared_ptr<secure_transport::TlsContextStore> tls_contexts,
+         std::shared_ptr<const server_runtime::ProtocolFactory> protocol_factory)
         : loop_id_(loop_id),
           name_("EpollLoop-" + std::to_string(loop_id)),
           idle_timeout_(idle_timeout),
           max_connections_(max_connections),
+          transport_mode_(transport_mode),
+          tls_contexts_(std::move(tls_contexts)),
+          protocol_factory_(std::move(protocol_factory)),
           epoll_fd_(create_epoll_handle()),
           listen_socket_(create_reuseport_listener(listen_port)),
           wake_fd_(create_event_handle()),
           reserve_fd_(open_reserve_fd()) {
+        if (protocol_factory_ == nullptr) {
+            throw std::invalid_argument("event loop requires a protocol factory");
+        }
         connections_.reserve(max_connections_);
         timing_wheel_.fill(-1);
         last_expired_tick_ = current_tick();
@@ -1526,11 +1689,13 @@ public:
             } else {
                 maybe_resume_accepting();
             }
+            const int wait_timeout = buffered_tls_reads_.empty()
+                ? static_cast<int>(kEpollWaitTimeout.count()) : 0;
             const int ready = ::epoll_wait(
                 epoll_fd_.fd(),
                 events.data(),
                 static_cast<int>(events.size()),
-                static_cast<int>(kEpollWaitTimeout.count()));
+                wait_timeout);
 
             if (ready < 0) {
                 if (errno == EINTR) {
@@ -1542,6 +1707,8 @@ public:
             for (int i = 0; i < ready; ++i) {
                 handle_event(events[static_cast<std::size_t>(i)]);
             }
+
+            process_buffered_tls_reads();
 
             expire_idle_connections();
         }
@@ -1574,17 +1741,20 @@ private:
     void register_fd(int fd, std::uint32_t events) {
         epoll_event ev{};
         ev.events = events;
-        ev.data.fd = fd;
+        ev.data.u64 = epoll_runtime::encode(epoll_runtime::ConnectionId{
+            .descriptor = static_cast<std::uint32_t>(fd), .generation = 0});
         if (::epoll_ctl(epoll_fd_.fd(), EPOLL_CTL_ADD, fd, &ev) < 0) {
             throw std::runtime_error(std::string("epoll_ctl(ADD) failed: ") + std::strerror(errno));
         }
     }
 
     // Adds client fd with events, logging and returning false on failure.
-    bool try_register_connection_fd(int fd, std::uint32_t events) noexcept {
+    bool try_register_connection_fd(int fd, std::uint32_t generation,
+                                    std::uint32_t events) noexcept {
         epoll_event ev{};
         ev.events = events;
-        ev.data.fd = fd;
+        ev.data.u64 = epoll_runtime::encode(epoll_runtime::ConnectionId{
+            .descriptor = static_cast<std::uint32_t>(fd), .generation = generation});
         if (::epoll_ctl(epoll_fd_.fd(), EPOLL_CTL_ADD, fd, &ev) == 0) {
             return true;
         }
@@ -1595,10 +1765,12 @@ private:
     }
 
     // Replaces fd's epoll interest mask with events, returning success status.
-    bool try_modify_fd(int fd, std::uint32_t events) noexcept {
+    bool try_modify_fd(int fd, std::uint32_t generation,
+                       std::uint32_t events) noexcept {
         epoll_event ev{};
         ev.events = events;
-        ev.data.fd = fd;
+        ev.data.u64 = epoll_runtime::encode(epoll_runtime::ConnectionId{
+            .descriptor = static_cast<std::uint32_t>(fd), .generation = generation});
         if (::epoll_ctl(epoll_fd_.fd(), EPOLL_CTL_MOD, fd, &ev) == 0) {
             return true;
         }
@@ -1700,6 +1872,15 @@ private:
                 std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
+    [[nodiscard]] std::uint32_t next_connection_generation() noexcept {
+        const std::uint32_t result = next_generation_;
+        ++next_generation_;
+        if (next_generation_ == 0) {
+            next_generation_ = 1;
+        }
+        return result;
+    }
+
     // Removes a connection from its intrusive timing-wheel list in O(1).
     void unschedule_timeout(ConnectionState& connection) noexcept {
         if (!connection.wheel_scheduled) {
@@ -1736,6 +1917,10 @@ private:
             connection.expiration_tick = std::min(connection.expiration_tick,
                                                   connection.response_deadline_tick);
         }
+        if (connection.tls_handshake_deadline_tick != 0) {
+            connection.expiration_tick = std::min(connection.expiration_tick,
+                                                  connection.tls_handshake_deadline_tick);
+        }
         connection.wheel_slot = static_cast<std::uint8_t>(
             connection.expiration_tick % kTimingWheelSlots);
         connection.wheel_next = timing_wheel_[connection.wheel_slot];
@@ -1755,20 +1940,126 @@ private:
         schedule_timeout(connection);
     }
 
+    bool advance_tls_handshake(ConnectionState& connection) noexcept {
+        if (connection.tls == nullptr || connection.tls_established) {
+            return true;
+        }
+        const secure_transport::IoStatus status = connection.tls->handshake();
+        switch (status) {
+        case secure_transport::IoStatus::Complete:
+            try {
+                if (connection.tls->session_reused() ||
+                    !connection.tls->peer_verified() ||
+                    !connection.tls->peer_authorized()) {
+                    log_tls_error(
+                        "rejected resumed, unverified, or unauthorized TLS peer",
+                        connection.fd());
+                    return false;
+                }
+            } catch (...) {
+                log_tls_error("rejected unverified or unauthorized TLS peer", connection.fd());
+                return false;
+            }
+            if (connection.tls_handshake_counted) {
+                --active_tls_handshakes_;
+                connection.tls_handshake_counted = false;
+            }
+            ++stats_.tls_handshakes_succeeded;
+            connection.tls_established = true;
+            connection.tls_wants_write = false;
+            connection.tls_retry_operation = TlsRetryOperation::None;
+            connection.tls_handshake_deadline_tick = 0;
+            touch(connection);
+            return true;
+        case secure_transport::IoStatus::WantRead:
+            connection.tls_wants_write = false;
+            return true;
+        case secure_transport::IoStatus::WantWrite:
+            connection.tls_wants_write = true;
+            return true;
+        case secure_transport::IoStatus::PeerClosed:
+            return false;
+        case secure_transport::IoStatus::Fatal:
+            log_tls_error(connection.tls->last_error(), connection.fd());
+            return false;
+        }
+        return false;
+    }
+
+    void log_tls_error(const std::string& message, int fd) noexcept {
+        if (tls_error_logs_ < kMaxTlsErrorLogsPerLoop) {
+            ++tls_error_logs_;
+            std::cerr << name_ << ' ' << message << " on fd " << fd << '\n';
+            if (tls_error_logs_ == kMaxTlsErrorLogsPerLoop) {
+                std::cerr << name_ << " suppressing further per-connection TLS errors\n";
+            }
+        }
+    }
+
+    void log_protocol_error(const char* message, int fd) noexcept {
+        if (protocol_error_logs_ < kMaxTlsErrorLogsPerLoop) {
+            ++protocol_error_logs_;
+            std::cerr << name_ << " protocol exception on fd " << fd
+                      << ": " << message << '\n';
+            if (protocol_error_logs_ == kMaxTlsErrorLogsPerLoop) {
+                std::cerr << name_ << " suppressing further protocol exception logs\n";
+            }
+        }
+    }
+
+    [[nodiscard]] bool defer_buffered_tls_read(ConnectionState& connection) noexcept {
+        if (connection.buffered_tls_read_queued) {
+            return true;
+        }
+        try {
+            buffered_tls_reads_.push_back(epoll_runtime::ConnectionId{
+                .descriptor = static_cast<std::uint32_t>(connection.fd()),
+                .generation = connection.generation});
+            connection.buffered_tls_read_queued = true;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // OpenSSL can retain decrypted bytes after the kernel socket is drained.
+    // Such bytes cannot generate another EPOLLIN notification, so process a
+    // bounded number of synthetic read-ready events before the next epoll wait.
+    void process_buffered_tls_reads() {
+        const std::size_t count = std::min(
+            buffered_tls_reads_.size(), kMaxDeferredTlsReadsPerIteration);
+        for (std::size_t index = 0; index < count; ++index) {
+            const epoll_runtime::ConnectionId id = buffered_tls_reads_.front();
+            buffered_tls_reads_.pop_front();
+            const int fd = static_cast<int>(id.descriptor);
+            ConnectionState* connection = connections_.find(fd);
+            if (connection == nullptr || connection->generation != id.generation) {
+                continue;
+            }
+            connection->buffered_tls_read_queued = false;
+            epoll_event event{};
+            event.events = EPOLLIN;
+            event.data.u64 = epoll_runtime::encode(id);
+            handle_event(event);
+        }
+    }
+
     // Routes one epoll event to wake, accept, read, write, error, or hangup logic.
     void handle_event(const epoll_event& event) {
-        if (event.data.fd == wake_fd_.fd()) {
+        const epoll_runtime::ConnectionId event_id = epoll_runtime::decode(event.data.u64);
+        const int event_fd = static_cast<int>(event_id.descriptor);
+        if (event_id.generation == 0 && event_fd == wake_fd_.fd()) {
             drain_wake_fd();
             return;
         }
 
-        if (event.data.fd == listen_socket_.fd()) {
+        if (event_id.generation == 0 && event_fd == listen_socket_.fd()) {
             accept_ready_connections();
             return;
         }
 
-        ConnectionState* connection = connections_.find(event.data.fd);
-        if (connection == nullptr) {
+        ConnectionState* connection = connections_.find(event_fd);
+        if (connection == nullptr || connection->generation != event_id.generation) {
             return;
         }
 
@@ -1788,35 +2079,55 @@ private:
         if ((event.events & EPOLLRDHUP) != 0U) {
             connection->peer_write_closed = true;
         }
+        if (!connection->tls_established) {
+            if (!advance_tls_handshake(*connection)) {
+                close_connection(event_fd);
+                return;
+            }
+            if (!connection->tls_established) {
+                if (!update_connection_interest(*connection)) {
+                    close_connection(event_fd);
+                }
+                return;
+            }
+        }
         bool keep_open = true;
-        if ((event.events & EPOLLIN) != 0U) {
+        const bool retrying_tls_write =
+            connection->tls_retry_operation == TlsRetryOperation::Write;
+        const bool read_ready = connection->tls_wants_write
+            ? (event.events & EPOLLOUT) != 0U
+            : (event.events & EPOLLIN) != 0U;
+        if (!retrying_tls_write && read_ready) {
             keep_open = handle_read(*connection);
-            connection = connections_.find(event.data.fd);
+            connection = connections_.find(event_fd);
         }
 
         if (!keep_open || connection == nullptr) {
-            close_connection(event.data.fd);
+            close_connection(event_fd);
             return;
         }
 
-        if (connection->has_responses() &&
-            (((event.events & EPOLLOUT) != 0U) || (event.events & EPOLLIN) != 0U)) {
+        const bool write_ready = connection->tls_wants_write
+            ? (event.events & EPOLLOUT) != 0U
+            : (event.events & EPOLLIN) != 0U || (event.events & EPOLLOUT) != 0U;
+        if (connection->has_responses() && write_ready &&
+            connection->tls_retry_operation != TlsRetryOperation::Read) {
             keep_open = handle_write(*connection);
         }
 
-        connection = connections_.find(event.data.fd);
+        connection = connections_.find(event_fd);
         if (!keep_open || connection == nullptr) {
-            close_connection(event.data.fd);
+            close_connection(event_fd);
             return;
         }
 
         if (full_hangup || (connection->peer_write_closed && !connection->has_responses())) {
-            close_connection(event.data.fd);
+            close_connection(event_fd);
             return;
         }
 
         if (!update_connection_interest(*connection)) {
-            close_connection(event.data.fd);
+            close_connection(event_fd);
         }
     }
 
@@ -1824,16 +2135,20 @@ private:
     // any unread/unwritten data is reported again without relying on ET sizing.
     bool update_connection_interest(ConnectionState& connection) noexcept {
         std::uint32_t events = EPOLLRDHUP | EPOLLERR;
-        if (!connection.peer_write_closed) {
-            events |= EPOLLIN;
-        }
-        if (connection.has_responses()) {
-            events |= EPOLLOUT;
+        if (!connection.tls_established) {
+            events |= connection.tls_wants_write ? EPOLLOUT : EPOLLIN;
+        } else {
+            if (!connection.peer_write_closed) {
+                events |= EPOLLIN;
+            }
+            if (connection.has_responses() || connection.tls_wants_write) {
+                events |= EPOLLOUT;
+            }
         }
         if (events == connection.registered_events) {
             return true;
         }
-        if (!try_modify_fd(connection.fd(), events)) {
+        if (!try_modify_fd(connection.fd(), connection.generation, events)) {
             return false;
         }
         connection.registered_events = events;
@@ -1844,6 +2159,13 @@ private:
     // and applies backpressure at resource or connection limits.
     void accept_ready_connections() {
         if (connections_.size() >= max_connections_) {
+            pause_accepting(kAcceptCapacityBackoff);
+            return;
+        }
+        if (transport_mode_ == secure_transport::Mode::Tls &&
+            active_tls_handshakes_ >=
+                std::min(max_connections_, kMaxTlsHandshakesPerLoop)) {
+            ++stats_.tls_handshakes_rejected_capacity;
             pause_accepting(kAcceptCapacityBackoff);
             return;
         }
@@ -1886,15 +2208,25 @@ private:
             bool connection_created = false;
             try {
                 configure_client_socket(client_fd);
+                const std::uint32_t generation = next_connection_generation();
                 ConnectionState& connection =
-                    connections_.emplace(std::move(client_socket));
+                    connections_.emplace(std::move(client_socket), generation, transport_mode_,
+                                         tls_contexts_ ? tls_contexts_->load() : nullptr,
+                                         *protocol_factory_);
                 connection_created = true;
+
+                if (!connection.tls_established) {
+                    ++active_tls_handshakes_;
+                    connection.tls_handshake_counted = true;
+                    connection.tls_handshake_deadline_tick = current_tick() +
+                        static_cast<std::uint64_t>(kTlsHandshakeTimeout.count()) + 1U;
+                }
 
                 // Register the socket before publishing its idle deadline.  If epoll
                 // registration fails, the whole connection transaction is rolled back.
                 constexpr std::uint32_t initial_events =
                     EPOLLIN | EPOLLRDHUP | EPOLLERR;
-                if (!try_register_connection_fd(client_fd, initial_events)) {
+                if (!try_register_connection_fd(client_fd, generation, initial_events)) {
                     connections_.erase(client_fd);
                     continue;
                 }
@@ -1938,112 +2270,147 @@ private:
 
         while (bytes_read < kMaxReadBytesPerEvent) {
             const std::size_t read_size = std::min(buffer.size(), kMaxReadBytesPerEvent - bytes_read);
-            const ssize_t n = ::recv(connection.fd(), buffer.data(), read_size, 0);
-            if (n < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            ssize_t n = 0;
+            if (connection.tls) {
+                const auto result = connection.tls->read(std::span<std::byte>(
+                    reinterpret_cast<std::byte*>(buffer.data()), read_size));
+                if (result.status == secure_transport::IoStatus::WantRead) {
+                    connection.tls_wants_write = false;
+                    connection.tls_retry_operation = TlsRetryOperation::None;
                     return true;
                 }
-                return false;
-            }
-
-            if (n == 0) {
-                connection.peer_write_closed = true;
-                return true;
-            }
-
-            const char* chunk = buffer.data();
-            const std::size_t chunk_size = static_cast<std::size_t>(n);
-            bytes_read += chunk_size;
-            std::size_t consumed = 0;
-            while (consumed < chunk_size) {
-                const void* newline_ptr =
-                    std::memchr(chunk + consumed, '\n', chunk_size - consumed);
-                const std::size_t fragment_size = newline_ptr == nullptr
-                    ? chunk_size - consumed
-                    : static_cast<std::size_t>(static_cast<const char*>(newline_ptr) -
-                                               (chunk + consumed));
-                if (connection.request_line.size() + fragment_size > kMaxRequestSize) {
+                if (result.status == secure_transport::IoStatus::WantWrite) {
+                    connection.tls_wants_write = true;
+                    connection.tls_retry_operation = TlsRetryOperation::Read;
+                    return true;
+                }
+                if (result.status == secure_transport::IoStatus::PeerClosed) {
+                    connection.peer_write_closed = true;
+                    return true;
+                }
+                if (result.status == secure_transport::IoStatus::Fatal) {
                     return false;
                 }
-                if (fragment_size != 0 && connection.request_deadline_tick == 0) {
+                connection.tls_wants_write = false;
+                connection.tls_retry_operation = TlsRetryOperation::None;
+                n = static_cast<ssize_t>(result.bytes);
+            } else {
+                n = ::recv(connection.fd(), buffer.data(), read_size, 0);
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        return true;
+                    }
+                    return false;
+                }
+                if (n == 0) {
+                    connection.peer_write_closed = true;
+                    return true;
+                }
+            }
+
+            const std::size_t chunk_size = static_cast<std::size_t>(n);
+            bytes_read += chunk_size;
+            const bool had_output = connection.protocol->has_output();
+            try {
+                if (!connection.protocol->consume(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(buffer.data()), chunk_size))) {
+                    return false;
+                }
+            } catch (const std::exception& error) {
+                ++stats_.protocol_exceptions;
+                log_protocol_error(error.what(), connection.fd());
+                return false;
+            } catch (...) {
+                ++stats_.protocol_exceptions;
+                log_protocol_error("unknown exception", connection.fd());
+                return false;
+            }
+            if (connection.protocol->has_partial_input()) {
+                if (connection.request_deadline_tick == 0) {
                     connection.request_deadline_tick = current_tick() +
                         static_cast<std::uint64_t>(kRequestCompletionTimeout.count()) + 1U;
                 }
-                connection.request_line.append(chunk + consumed, fragment_size);
-                consumed += fragment_size;
-                if (newline_ptr == nullptr) {
-                    break;
-                }
-                ++consumed;
-                if (!connection.request_line.empty() &&
-                    connection.request_line.back() == '\r') {
-                    connection.request_line.pop_back();
-                }
-                if (connection.request_line.empty() || connection.response_queue_full()) {
-                    return false;
-                }
-                const std::optional<ResponseBufferView> response =
-                    find_client_response(connection.request_line);
-                if (!response.has_value()) {
-                    return false;
-                }
-                const bool starting_response = !connection.has_responses();
-                if (!connection.push_response(*response)) {
-                    return false;
-                }
-                if (starting_response) {
-                    connection.response_deadline_tick = current_tick() +
-                        static_cast<std::uint64_t>(kResponseDrainTimeout.count()) + 1U;
-                }
-                connection.request_line.clear();
+            } else {
                 connection.request_deadline_tick = 0;
+            }
+            if (!had_output && connection.protocol->has_output()) {
+                connection.response_deadline_tick = current_tick() +
+                    static_cast<std::uint64_t>(kResponseDrainTimeout.count()) + 1U;
             }
             touch(connection);
         }
-
-        return true;
+        return connection.tls == nullptr || !connection.tls->has_buffered_plaintext() ||
+               defer_buffered_tls_read(connection);
     }
 
     // Sends queued responses in request order while bounding work per event.
     bool handle_write(ConnectionState& connection) {
         std::size_t bytes_written = 0;
         while (connection.has_responses() && bytes_written < kMaxWriteBytesPerEvent) {
-            const ResponseBufferView& response = connection.current_response();
             const std::size_t budget = kMaxWriteBytesPerEvent - bytes_written;
-            const std::size_t header_remaining =
-                connection.response_header.size() - connection.response_header_sent;
-            const std::size_t header_size = std::min(header_remaining, budget);
-            const std::size_t payload_budget = budget - header_size;
-            const std::size_t payload_remaining = response.size - connection.response_sent;
-            const std::size_t payload_size = std::min(payload_remaining, payload_budget);
+            const server_runtime::OutputBatch output = connection.protocol->output();
+            if (output.count == 0 || output.count > output.slices.size()) {
+                return false;
+            }
+            if (output.lifetime) {
+                connection.output_lifetime = output.lifetime;
+            }
 
             // A single vectored write normally emits the framing header and payload
             // together. This preserves zero-copy views into the immutable mapping
             // while avoiding a syscall and a small TCP segment per response.
             std::array<iovec, 2> vectors{};
             int vector_count = 0;
-            if (header_size != 0) {
+            std::size_t remaining_budget = budget;
+            for (std::size_t i = 0; i < output.count && remaining_budget != 0; ++i) {
+                const std::size_t slice_size =
+                    std::min(output.slices[i].size(), remaining_budget);
+                if (slice_size == 0) {
+                    continue;
+                }
                 vectors[static_cast<std::size_t>(vector_count++)] = iovec{
-                    .iov_base = connection.response_header.data() +
-                                connection.response_header_sent,
-                    .iov_len = header_size};
+                    .iov_base = const_cast<std::byte*>(output.slices[i].data()),
+                    .iov_len = slice_size};
+                remaining_budget -= slice_size;
             }
-            if (payload_size != 0) {
-                vectors[static_cast<std::size_t>(vector_count++)] = iovec{
-                    .iov_base = const_cast<std::uint8_t*>(response.data +
-                                                         connection.response_sent),
-                    .iov_len = payload_size};
+            if (vector_count == 0) {
+                return false;
             }
 
             msghdr message{};
             message.msg_iov = vectors.data();
             message.msg_iovlen = static_cast<std::size_t>(vector_count);
-            const ssize_t n = ::sendmsg(connection.fd(),
-                                        &message,
-                                        MSG_NOSIGNAL | MSG_DONTWAIT);
+            ssize_t n = 0;
+            if (connection.tls) {
+                const std::size_t tls_size = vectors[0].iov_len;
+                const auto result = connection.tls->write(std::span<const std::byte>(
+                    static_cast<const std::byte*>(vectors[0].iov_base), tls_size));
+                if (result.status == secure_transport::IoStatus::WantRead) {
+                    connection.tls_wants_write = false;
+                    connection.tls_retry_operation = TlsRetryOperation::Write;
+                    return true;
+                }
+                if (result.status == secure_transport::IoStatus::WantWrite) {
+                    connection.tls_wants_write = true;
+                    // OpenSSL requires the same SSL_write_ex call to be retried
+                    // before any other I/O that could advance this SSL object.
+                    connection.tls_retry_operation = TlsRetryOperation::Write;
+                    return true;
+                }
+                if (result.status != secure_transport::IoStatus::Complete) {
+                    return false;
+                }
+                connection.tls_wants_write = false;
+                connection.tls_retry_operation = TlsRetryOperation::None;
+                n = static_cast<ssize_t>(result.bytes);
+            } else {
+                n = ::sendmsg(connection.fd(),
+                              &message,
+                              MSG_NOSIGNAL | MSG_DONTWAIT);
+            }
             if (n < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -2058,16 +2425,11 @@ private:
             }
 
             const std::size_t sent = static_cast<std::size_t>(n);
-            const std::size_t header_sent = std::min(sent, header_size);
-            connection.response_header_sent += header_sent;
-            connection.response_sent += sent - header_sent;
+            connection.protocol->consume_output(sent);
             bytes_written += sent;
-            if (connection.response_header_sent == connection.response_header.size() &&
-                connection.response_sent == response.size) {
-                connection.pop_response();
-                if (!connection.has_responses()) {
-                    connection.response_deadline_tick = 0;
-                }
+            if (!connection.has_responses()) {
+                connection.response_deadline_tick = 0;
+                connection.output_lifetime.reset();
             }
             // Progress refreshes inactivity only. The absolute response deadline
             // prevents a slow reader from retaining this connection indefinitely.
@@ -2109,7 +2471,15 @@ private:
         }
 
         unschedule_timeout(*connection);
+        if (connection->tls_handshake_counted) {
+            --active_tls_handshakes_;
+            connection->tls_handshake_counted = false;
+            ++stats_.tls_handshakes_failed;
+        }
         remove_fd(fd);
+        if (connection->tls != nullptr && connection->tls_established) {
+            (void)connection->tls->shutdown();
+        }
         connections_.erase(fd);
         ++stats_.closed;
     }
@@ -2128,6 +2498,9 @@ private:
     std::string name_;
     std::chrono::seconds idle_timeout_;
     std::size_t max_connections_;
+    secure_transport::Mode transport_mode_;
+    std::shared_ptr<secure_transport::TlsContextStore> tls_contexts_;
+    std::shared_ptr<const server_runtime::ProtocolFactory> protocol_factory_;
     EventLoopStats stats_;
     UniqueFd epoll_fd_;
     UniqueFd listen_socket_;
@@ -2138,6 +2511,11 @@ private:
     ConnectionTable connections_;
     std::array<int, kTimingWheelSlots> timing_wheel_{};
     std::uint64_t last_expired_tick_ = 0;
+    std::size_t active_tls_handshakes_ = 0;
+    std::size_t tls_error_logs_ = 0;
+    std::size_t protocol_error_logs_ = 0;
+    std::uint32_t next_generation_ = 1;
+    std::deque<epoll_runtime::ConnectionId> buffered_tls_reads_;
 };
 
 // Constructs the public worker facade from its identifier, shared port,
@@ -2145,8 +2523,13 @@ private:
 EventLoop::EventLoop(std::size_t loop_id,
                      int listen_port,
                      std::chrono::seconds idle_timeout,
-                     std::size_t max_connections)
-    : impl_(std::make_unique<Impl>(loop_id, listen_port, idle_timeout, max_connections)) {}
+                     std::size_t max_connections,
+                     secure_transport::Mode transport_mode,
+                     std::shared_ptr<secure_transport::TlsContextStore> tls_contexts,
+                     std::shared_ptr<const server_runtime::ProtocolFactory> protocol_factory)
+    : impl_(std::make_unique<Impl>(loop_id, listen_port, idle_timeout, max_connections,
+                                   transport_mode, std::move(tls_contexts),
+                                   std::move(protocol_factory))) {}
 
 EventLoop::~EventLoop() noexcept = default;
 
@@ -2171,6 +2554,12 @@ void start_listen(int listen_port,
                   std::size_t event_loop_count,
                   std::chrono::seconds idle_timeout,
                   std::size_t max_connections_per_loop,
+                  secure_transport::Mode transport_mode,
+                  const secure_transport::ServerTlsConfig& tls_config,
+                  const std::string& tls_client_allowlist_file,
+                  const std::string& tls_key_passphrase_file,
+                  std::shared_ptr<secure_transport::TlsContextStore> tls_contexts,
+                  std::shared_ptr<const server_runtime::ProtocolFactory> protocol_factory,
                   UniqueFd port_instance_lock) {
     // Ownership of this descriptor keeps the advisory lock for the full
     // lifetime of the listening server.
@@ -2180,9 +2569,16 @@ void start_listen(int listen_port,
     SignalFd termination_signals;
     UniqueFd worker_completion = create_event_handle();
     std::cout << "Listening on port " << listen_port
+              << " transport=" << secure_transport::mode_name(transport_mode)
               << " using " << event_loop_count
               << " epoll event loop(s) with SO_REUSEPORT; maximum active connections: "
               << (event_loop_count * max_connections_per_loop) << std::endl;
+    if (transport_mode == secure_transport::Mode::Tls) {
+        std::cout << "TLS policy="
+                  << secure_transport::tls_version_policy_name(tls_config.version_policy)
+                  << " mTLS=required session_resumption=disabled early_data=disabled library="
+                  << secure_transport::runtime_version() << '\n';
+    }
 
     // Construct every event loop before starting threads. Listener or epoll
     // creation failures therefore cannot leave a partially running server.
@@ -2190,7 +2586,8 @@ void start_listen(int listen_port,
     event_loops.reserve(event_loop_count);
     for (std::size_t i = 0; i < event_loop_count; ++i) {
         event_loops.push_back(std::make_unique<EventLoop>(
-            i + 1, listen_port, idle_timeout, max_connections_per_loop));
+            i + 1, listen_port, idle_timeout, max_connections_per_loop,
+            transport_mode, tls_contexts, protocol_factory));
     }
 
     const auto wake_all = [&event_loops]() noexcept {
@@ -2293,6 +2690,29 @@ void start_listen(int listen_port,
                                                  &signal_info,
                                                  sizeof(signal_info));
                     if (count == static_cast<ssize_t>(sizeof(signal_info))) {
+                        if (signal_info.ssi_signo == SIGHUP) {
+                            if (transport_mode == secure_transport::Mode::Tls && tls_contexts) {
+                                try {
+                                    secure_transport::ServerTlsConfig reload_config = tls_config;
+                                    if (!tls_key_passphrase_file.empty()) {
+                                        reload_config.private_key_passphrase =
+                                            secure_transport::load_private_key_passphrase_file(
+                                                tls_key_passphrase_file);
+                                    }
+                                    reload_config.allowed_client_sans =
+                                        load_tls_client_allowlist(tls_client_allowlist_file);
+                                    auto replacement =
+                                        secure_transport::TlsContext::make_server(reload_config);
+                                    tls_contexts->store(std::move(replacement));
+                                    std::cout << "Reloaded TLS certificate, key, CA, CRL, and "
+                                                 "client authorization policy\n";
+                                } catch (const std::exception& error) {
+                                    std::cerr << "TLS reload failed; retaining previous context: "
+                                              << error.what() << '\n';
+                                }
+                            }
+                            continue;
+                        }
                         last_termination_signal =
                             static_cast<int>(signal_info.ssi_signo);
                         begin_graceful_shutdown();
@@ -2360,6 +2780,11 @@ void start_listen(int listen_port,
         totals.accepted += loop_stats.accepted;
         totals.rejected += loop_stats.rejected;
         totals.closed += loop_stats.closed;
+        totals.tls_handshakes_succeeded += loop_stats.tls_handshakes_succeeded;
+        totals.tls_handshakes_failed += loop_stats.tls_handshakes_failed;
+        totals.tls_handshakes_rejected_capacity +=
+            loop_stats.tls_handshakes_rejected_capacity;
+        totals.protocol_exceptions += loop_stats.protocol_exceptions;
     }
 
     std::cout << "Shutdown"
@@ -2369,7 +2794,12 @@ void start_listen(int listen_port,
                             std::to_string(last_termination_signal))
               << ". accepted=" << totals.accepted
               << " rejected=" << totals.rejected
-              << " closed=" << totals.closed << std::endl;
+              << " closed=" << totals.closed
+              << " tls_handshakes_succeeded=" << totals.tls_handshakes_succeeded
+              << " tls_handshakes_failed=" << totals.tls_handshakes_failed
+              << " tls_handshakes_rejected_capacity="
+              << totals.tls_handshakes_rejected_capacity
+              << " protocol_exceptions=" << totals.protocol_exceptions << std::endl;
 }
 
 // Parses server and mapping options, initializes the shared request mapping,
@@ -2382,6 +2812,15 @@ void print_server_usage(std::ostream& output, std::string_view program) {
         << "Options:\n"
         << "  -h, --help                         Show this help and exit\n"
         << "  --listen <port>                    Listen on TCP port 1..65535\n"
+        << "  --transport <tls|tcp>              Transport (default: tls; tcp is insecure)\n"
+        << "  --tls-cert <path>                  Server certificate chain for TLS\n"
+        << "  --tls-key <path>                   Server private key for TLS\n"
+        << "  --tls-key-passphrase-file <path>   Owner-only runtime credential file\n"
+        << "  --tls-client-ca <path>             CA bundle trusted for client mTLS certs\n"
+        << "  --tls-client-crl <path>            Optional PEM CRL for client certificates\n"
+        << "  --tls-client-allowlist <path>      Required exact URI:/DNS: SAN allowlist\n"
+        << "  --tls-version <policy>             tls13 (default), tls12, or tls12-or-tls13\n"
+        << "  --tls-allow-tls12                  Alias for --tls-version tls12-or-tls13\n"
         << "  --mapping-file <path>              Mapping file (default: "
         << tcp_common::kDefaultServerMappingFile << ")\n"
         << "  --mapping-loader <mode>            ifstream, mmap, or mmap-view\n"
@@ -2397,10 +2836,11 @@ void print_server_usage(std::ostream& output, std::string_view program) {
         << "  --keys-output <path>               Export destination (default: "
         << tcp_common::kDefaultClientKeysFile << ")\n\n"
         << "Examples:\n"
-        << "  " << program << " --listen 23456 --mapping-file "
+        << "  " << program << " --listen 23456 --transport tcp --mapping-file "
         << tcp_common::kDefaultServerMappingFile << "\n"
         << "  " << program
-        << " --listen 23456 --mapping-file server --mapping-loader mmap-view\n"
+        << " --listen 23456 --transport tcp --mapping-file server"
+           " --mapping-loader mmap-view\n"
         << "  " << program
         << " --regen-mapping --mapping-entries 500000 --export-keys 500000\n\n"
         << "Options use a space between the option and its value; for example,\n"
@@ -2423,6 +2863,11 @@ int main(int argc, char* argv[]) {
         std::string keys_output_file = tcp_common::kDefaultClientKeysFile;
         MappingLoadMode mapping_load_mode = MappingLoadMode::MMapView;
         std::chrono::seconds idle_timeout = kDefaultIdleTimeout;
+        secure_transport::Mode transport_mode = secure_transport::Mode::Tls;
+        secure_transport::ServerTlsConfig tls_config;
+        std::string tls_client_allowlist_file;
+        std::string tls_key_passphrase_file;
+        bool tls_version_option_set = false;
 
         if (argc < 2) {
             throw std::invalid_argument("no mode or option was provided");
@@ -2440,6 +2885,47 @@ int main(int argc, char* argv[]) {
                 listen_port = parse_int_arg(argv[i + 1], "--listen");
                 has_listen = true;
                 ++i;
+            } else if (arg == "--transport") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--transport requires tls or tcp");
+                }
+                transport_mode = secure_transport::parse_mode(argv[++i]);
+            } else if (arg == "--tls-cert") {
+                if (i + 1 >= argc) throw std::invalid_argument("--tls-cert requires a path");
+                tls_config.certificate_chain_file = argv[++i];
+            } else if (arg == "--tls-key") {
+                if (i + 1 >= argc) throw std::invalid_argument("--tls-key requires a path");
+                tls_config.private_key_file = argv[++i];
+            } else if (arg == "--tls-key-passphrase-file") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-key-passphrase-file requires a path");
+                }
+                tls_key_passphrase_file = argv[++i];
+            } else if (arg == "--tls-client-ca") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-client-ca requires a path");
+                }
+                tls_config.client_ca_file = argv[++i];
+            } else if (arg == "--tls-client-crl") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-client-crl requires a path");
+                }
+                tls_config.client_crl_file = argv[++i];
+            } else if (arg == "--tls-client-allowlist") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-client-allowlist requires a path");
+                }
+                tls_client_allowlist_file = argv[++i];
+            } else if (arg == "--tls-allow-tls12") {
+                tls_config.version_policy = secure_transport::TlsVersionPolicy::Tls12And13;
+                tls_version_option_set = true;
+            } else if (arg == "--tls-version") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-version requires a policy");
+                }
+                tls_config.version_policy =
+                    secure_transport::parse_tls_version_policy(argv[++i]);
+                tls_version_option_set = true;
             } else if (arg == "--mapping-file") {
                 if (i + 1 >= argc) {
                     throw std::invalid_argument("--mapping-file requires a file path");
@@ -2550,6 +3036,32 @@ int main(int argc, char* argv[]) {
             throw std::invalid_argument("Port must be in range 1..65535");
         }
 
+        std::shared_ptr<secure_transport::TlsContextStore> tls_contexts;
+        if (has_listen && transport_mode == secure_transport::Mode::Tls) {
+            if (tls_config.certificate_chain_file.empty() ||
+                tls_config.private_key_file.empty() || tls_config.client_ca_file.empty() ||
+                tls_client_allowlist_file.empty()) {
+                throw std::invalid_argument(
+                    "TLS mode requires --tls-cert, --tls-key, --tls-client-ca, and "
+                    "--tls-client-allowlist");
+            }
+            if (!tls_key_passphrase_file.empty()) {
+                tls_config.private_key_passphrase =
+                    secure_transport::load_private_key_passphrase_file(
+                        tls_key_passphrase_file);
+            }
+            tls_config.allowed_client_sans =
+                load_tls_client_allowlist(tls_client_allowlist_file);
+            tls_contexts = std::make_shared<secure_transport::TlsContextStore>(
+                secure_transport::TlsContext::make_server(tls_config));
+        } else if (transport_mode == secure_transport::Mode::Tcp &&
+                   (!tls_config.certificate_chain_file.empty() ||
+                    !tls_config.private_key_file.empty() || !tls_config.client_ca_file.empty() ||
+                    !tls_config.client_crl_file.empty() || !tls_client_allowlist_file.empty() ||
+                    !tls_key_passphrase_file.empty() || tls_version_option_set)) {
+            throw std::invalid_argument("--tls-* options cannot be used with --transport tcp");
+        }
+
         if (has_listen) {
             validate_file_descriptor_capacity(event_loop_count,
                                               max_connections_per_loop);
@@ -2575,10 +3087,17 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
+        auto protocol_factory = std::make_shared<MappingProtocolFactory>();
         start_listen(listen_port,
                      event_loop_count,
                      idle_timeout,
                      max_connections_per_loop,
+                     transport_mode,
+                     tls_config,
+                     tls_client_allowlist_file,
+                     tls_key_passphrase_file,
+                     std::move(tls_contexts),
+                     std::move(protocol_factory),
                      std::move(port_instance_lock));
         return 0;
     } catch (const std::invalid_argument& ex) {

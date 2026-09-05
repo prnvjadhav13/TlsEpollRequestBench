@@ -17,6 +17,7 @@
 #include <sstream>
 #include <fstream>
 #include <random>
+#include <span>
 #include <algorithm>
 #include <chrono>
 #include <limits>
@@ -35,6 +36,7 @@
 #include <unistd.h>
 
 #include "tcp_common_config.h"
+#include "secure_transport.h"
 
 namespace {
 
@@ -157,8 +159,18 @@ private:
 // server_ip and server_port identify the endpoint used by connect_to_server().
 class TcpClient {
 public:
-    TcpClient(const std::string& server_ip, std::uint16_t server_port) noexcept
-        : server_ip_(server_ip), server_port_(server_port) {}
+    TcpClient(const std::string& server_ip,
+              std::uint16_t server_port,
+              secure_transport::Mode transport_mode,
+              std::shared_ptr<secure_transport::TlsContext> tls_context,
+              const std::string& expected_server_name) noexcept
+        : server_ip_(server_ip),
+          server_port_(server_port),
+          transport_mode_(transport_mode),
+          tls_context_(std::move(tls_context)),
+          expected_server_name_(expected_server_name) {}
+
+    ~TcpClient() noexcept { disconnect(); }
 
     // Opens the configured endpoint with a bounded nonblocking connect, then
     // switches to blocking I/O with send and receive timeouts.
@@ -197,13 +209,43 @@ public:
                                      std::strerror(errno));
         }
         set_socket_io_timeout(socket_.get(), kClientIoTimeout);
+        if (transport_mode_ == secure_transport::Mode::Tls) {
+            try {
+                tls_ = std::make_unique<secure_transport::TlsSession>(
+                    tls_context_, socket_.get(), false, expected_server_name_);
+                const auto status = tls_->handshake();
+                if (status != secure_transport::IoStatus::Complete ||
+                    tls_->session_reused() || !tls_->peer_verified()) {
+                    const std::string detail = tls_->last_error().empty()
+                        ? "server certificate verification, full handshake, or TLS handshake failed"
+                        : tls_->last_error();
+                    throw ConnectError("TLS connection to " + endpoint() + " failed: " + detail);
+                }
+            } catch (...) {
+                tls_.reset();
+                socket_.reset();
+                throw;
+            }
+        }
     }
 
     [[nodiscard]] bool connected() const noexcept {
         return socket_.valid();
     }
 
+    [[nodiscard]] std::string negotiated_tls_version() const {
+        return tls_ ? tls_->negotiated_version() : std::string{};
+    }
+
+    [[nodiscard]] std::string negotiated_tls_cipher() const {
+        return tls_ ? tls_->negotiated_cipher() : std::string{};
+    }
+
     void disconnect() noexcept {
+        // Do not wait for a bidirectional close_notify exchange here: workers may
+        // be recovering a failed socket or stopping after a timeout. Releasing
+        // SSL before the descriptor guarantees bounded shutdown.
+        tls_.reset();
         socket_.reset();
     }
 
@@ -338,9 +380,29 @@ private:
     // Sends exactly size bytes beginning at data, retrying interrupted and
     // partial writes.
     void send_all(const std::uint8_t* data, std::size_t size) {
+        const auto deadline = std::chrono::steady_clock::now() + kClientIoTimeout;
         std::size_t sent = 0;
         while (sent < size) {
-            ssize_t n = ::send(socket_.get(), data + sent, size - sent, MSG_NOSIGNAL);
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("send timed out before the request completed");
+            }
+            if (tls_) {
+                const auto result = tls_->write(std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(data + sent), size - sent));
+                if (result.status == secure_transport::IoStatus::Complete) {
+                    sent += result.bytes;
+                    continue;
+                }
+                if (result.status == secure_transport::IoStatus::WantRead ||
+                    result.status == secure_transport::IoStatus::WantWrite) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        throw std::runtime_error("TLS send timed out before the request completed");
+                    }
+                    continue;
+                }
+                throw std::runtime_error("TLS send failed: " + tls_->last_error());
+            }
+            const ssize_t n = ::send(socket_.get(), data + sent, size - sent, MSG_NOSIGNAL);
             if (n < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -356,8 +418,29 @@ private:
 
     // Receives exactly size bytes or reports a stale/failed persistent socket.
     void receive_exact(std::uint8_t* data, std::size_t size) {
+        const auto deadline = std::chrono::steady_clock::now() + kClientIoTimeout;
         std::size_t received = 0;
         while (received < size) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("receive timed out before the response completed");
+            }
+            if (tls_) {
+                const auto result = tls_->read(std::span<std::byte>(
+                    reinterpret_cast<std::byte*>(data + received), size - received));
+                if (result.status == secure_transport::IoStatus::Complete) {
+                    received += result.bytes;
+                    continue;
+                }
+                if (result.status == secure_transport::IoStatus::WantRead ||
+                    result.status == secure_transport::IoStatus::WantWrite) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        throw std::runtime_error(
+                            "TLS receive timed out before the response completed");
+                    }
+                    continue;
+                }
+                throw std::runtime_error("TLS receive failed: " + tls_->last_error());
+            }
             const ssize_t n = ::recv(socket_.get(), data + received, size - received, 0);
             if (n < 0) {
                 if (errno == EINTR) {
@@ -374,7 +457,11 @@ private:
 
     const std::string& server_ip_;
     std::uint16_t server_port_;
+    secure_transport::Mode transport_mode_;
+    std::shared_ptr<secure_transport::TlsContext> tls_context_;
+    const std::string& expected_server_name_;
     Socket socket_;
+    std::unique_ptr<secure_transport::TlsSession> tls_;
 };
 
 // Converts binary response data into a review-friendly, 16-byte-per-line hex
@@ -552,10 +639,16 @@ public:
     BoundedWorkerPool(std::size_t worker_count,
                       std::size_t queue_capacity,
                       std::string server_ip,
-                      std::uint16_t server_port)
+                      std::uint16_t server_port,
+                      secure_transport::Mode transport_mode,
+                      std::shared_ptr<secure_transport::TlsContext> tls_context,
+                      std::string expected_server_name)
         : queue_capacity_(queue_capacity),
           server_ip_(std::move(server_ip)),
-          server_port_(server_port) {
+          server_port_(server_port),
+          transport_mode_(transport_mode),
+          tls_context_(std::move(tls_context)),
+          expected_server_name_(std::move(expected_server_name)) {
         workers_.reserve(worker_count);
         try {
             for (std::size_t i = 0; i < worker_count; ++i) {
@@ -613,9 +706,22 @@ public:
         }
     }
 
+    [[nodiscard]] std::string tls_negotiation_summary() const {
+        std::lock_guard lock(tls_negotiation_mutex_);
+        if (tls_version_.empty()) {
+            return "unavailable";
+        }
+        std::string result = tls_version_ + "/" + tls_cipher_;
+        if (mixed_tls_negotiation_) {
+            result += " (mixed across reconnects)";
+        }
+        return result;
+    }
+
 private:
     void worker_loop() noexcept {
-        TcpClient client(server_ip_, server_port_);
+        TcpClient client(server_ip_, server_port_, transport_mode_, tls_context_,
+                         expected_server_name_);
         std::vector<std::uint8_t> response;
         response.reserve(tcp_common::kMaxPayloadSize);
         for (;;) {
@@ -652,6 +758,7 @@ private:
                 }
                 if (!client.connected()) {
                     client.connect_to_server();
+                    record_tls_negotiation(client);
                 }
                 client.send_request(round.requests[i]);
                 client.receive_response(response);
@@ -716,15 +823,41 @@ private:
         }
     }
 
+    void record_tls_negotiation(const TcpClient& client) noexcept {
+        if (transport_mode_ != secure_transport::Mode::Tls) {
+            return;
+        }
+        try {
+            const std::string version = client.negotiated_tls_version();
+            const std::string cipher = client.negotiated_tls_cipher();
+            std::lock_guard lock(tls_negotiation_mutex_);
+            if (tls_version_.empty()) {
+                tls_version_ = version;
+                tls_cipher_ = cipher;
+            } else if (tls_version_ != version || tls_cipher_ != cipher) {
+                mixed_tls_negotiation_ = true;
+            }
+        } catch (...) {
+            // Negotiation reporting is diagnostic and cannot fail a request.
+        }
+    }
+
     std::size_t queue_capacity_;
     std::string server_ip_;
     std::uint16_t server_port_;
+    secure_transport::Mode transport_mode_;
+    std::shared_ptr<secure_transport::TlsContext> tls_context_;
+    std::string expected_server_name_;
     std::mutex queue_mutex_;
     std::condition_variable queue_not_empty_;
     std::condition_variable queue_not_full_;
     std::deque<RequestJob> queue_;
     bool stopping_ = false;
     std::vector<std::thread> workers_;
+    mutable std::mutex tls_negotiation_mutex_;
+    std::string tls_version_;
+    std::string tls_cipher_;
+    bool mixed_tls_negotiation_ = false;
 };
 
 bool wait_between_rounds(int delay_ms) {
@@ -749,6 +882,15 @@ void print_client_usage(std::ostream& output, std::string_view program) {
         << "  <server-port>                Server TCP port in range 1..65535\n\n"
         << "Options:\n"
         << "  -h, --help                   Show this help and exit\n"
+        << "  --transport <tls|tcp>        Transport mode (default: tls; tcp is insecure)\n"
+        << "  --tls-ca <path>              CA bundle used to verify the server\n"
+        << "  --tls-cert <path>            Client certificate chain for mutual TLS\n"
+        << "  --tls-key <path>             Client private key for mutual TLS\n"
+        << "  --tls-key-passphrase-file <path> Owner-only runtime credential file\n"
+        << "  --tls-server-name <name>     Expected server DNS name or IP in certificate\n"
+        << "  --tls-server-crl <path>      Optional PEM CRL for server certificates\n"
+        << "  --tls-version <policy>       tls13 (default), tls12, or tls12-or-tls13\n"
+        << "  --tls-allow-tls12            Alias for --tls-version tls12-or-tls13\n"
         << "  --keys-file <path>           Request-key file (default: "
         << tcp_common::kDefaultClientKeysFile << ")\n"
         << "  --request-count <count>      Requests per round (default: "
@@ -763,11 +905,14 @@ void print_client_usage(std::ostream& output, std::string_view program) {
         << "  --round-delay-ms <ms>        Delay between --forever rounds (default: 0,\n"
         << "                                maximum: " << kMaxRoundDelayMs << ")\n\n"
         << "Examples:\n"
-        << "  " << program << " 127.0.0.1 23456\n"
+        << "  " << program << " 127.0.0.1 23456 --transport tcp\n"
         << "  " << program
-        << " 127.0.0.1 23456 --request-count 1000 --max-concurrency 8\n"
+        << " 127.0.0.1 23457 --transport tls --tls-ca certs/ca.pem"
+           " --tls-cert certs/client.pem --tls-key certs/client.key"
+           " --tls-server-name server.lab --request-count 1000\n"
         << "  " << program
-        << " 127.0.0.1 23456 --request-count 1000 --forever --round-delay-ms 1000\n\n"
+        << " 127.0.0.1 23456 --transport tcp --request-count 1000"
+           " --forever --round-delay-ms 1000\n\n"
         << "Options use a space between the option and its value; for example,\n"
         << "--request-count 1000 (not --request-count=1000).\n";
 }
@@ -798,12 +943,55 @@ int main(int argc, char* argv[]) {
         std::size_t max_concurrency = detected_cpu_count;
         std::size_t queue_capacity = 0; // Derived from worker count unless explicitly set.
         int round_delay_ms = 0;
+        secure_transport::Mode transport_mode = secure_transport::Mode::Tls;
+        secure_transport::ClientTlsConfig tls_config;
+        std::string tls_key_passphrase_file;
+        bool tls_version_option_set = false;
 
         for (int i = 3; i < argc; ++i) {
             const std::string_view arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 print_client_usage(std::cout, argv[0]);
                 return 0;
+            } else if (arg == "--transport") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--transport requires tls or tcp");
+                }
+                transport_mode = secure_transport::parse_mode(argv[++i]);
+            } else if (arg == "--tls-ca") {
+                if (i + 1 >= argc) throw std::invalid_argument("--tls-ca requires a path");
+                tls_config.server_ca_file = argv[++i];
+            } else if (arg == "--tls-cert") {
+                if (i + 1 >= argc) throw std::invalid_argument("--tls-cert requires a path");
+                tls_config.certificate_chain_file = argv[++i];
+            } else if (arg == "--tls-key") {
+                if (i + 1 >= argc) throw std::invalid_argument("--tls-key requires a path");
+                tls_config.private_key_file = argv[++i];
+            } else if (arg == "--tls-key-passphrase-file") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-key-passphrase-file requires a path");
+                }
+                tls_key_passphrase_file = argv[++i];
+            } else if (arg == "--tls-server-name") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-server-name requires a DNS name or IP");
+                }
+                tls_config.expected_server_name = argv[++i];
+            } else if (arg == "--tls-server-crl") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-server-crl requires a path");
+                }
+                tls_config.server_crl_file = argv[++i];
+            } else if (arg == "--tls-allow-tls12") {
+                tls_config.version_policy = secure_transport::TlsVersionPolicy::Tls12And13;
+                tls_version_option_set = true;
+            } else if (arg == "--tls-version") {
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument("--tls-version requires a policy");
+                }
+                tls_config.version_policy =
+                    secure_transport::parse_tls_version_policy(argv[++i]);
+                tls_version_option_set = true;
             } else if (arg == "--keys-file") {
                 if (i + 1 >= argc) {
                     throw std::invalid_argument("--keys-file requires a file path");
@@ -871,6 +1059,28 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        std::shared_ptr<secure_transport::TlsContext> tls_context;
+        if (transport_mode == secure_transport::Mode::Tls) {
+            if (tls_config.server_ca_file.empty() || tls_config.certificate_chain_file.empty() ||
+                tls_config.private_key_file.empty() || tls_config.expected_server_name.empty()) {
+                throw std::invalid_argument(
+                    "TLS mode requires --tls-ca, --tls-cert, --tls-key, and --tls-server-name");
+            }
+            if (!tls_key_passphrase_file.empty()) {
+                tls_config.private_key_passphrase =
+                    secure_transport::load_private_key_passphrase_file(
+                        tls_key_passphrase_file);
+            }
+            tls_context = secure_transport::TlsContext::make_client(tls_config);
+        } else if (!tls_config.server_ca_file.empty() ||
+                   !tls_config.certificate_chain_file.empty() ||
+                   !tls_config.private_key_file.empty() ||
+                   !tls_config.expected_server_name.empty() ||
+                   !tls_config.server_crl_file.empty() || !tls_key_passphrase_file.empty() ||
+                   tls_version_option_set) {
+            throw std::invalid_argument("--tls-* options cannot be used with --transport tcp");
+        }
+
         install_termination_signal_handlers();
         const std::vector<std::string> all_requests = load_request_keys(keys_file);
         const std::size_t worker_count = std::min(request_count, max_concurrency);
@@ -885,6 +1095,7 @@ int main(int argc, char* argv[]) {
                 std::max<std::size_t>(1, std::min(request_count, worker_count * 2)));
         }
         std::cout << "Loaded " << all_requests.size() << " request key(s) from " << keys_file
+                  << ". transport=" << secure_transport::mode_name(transport_mode)
                   << ". Sending " << request_count << " request(s) per round"
                   << (run_forever ? " forever" : "")
                   << " with " << worker_count << " persistent worker thread(s)"
@@ -896,10 +1107,18 @@ int main(int argc, char* argv[]) {
                           : "")
                   << (verbose_output ? " (verbose mode)." : " (summary mode).")
                   << '\n';
+        if (transport_mode == secure_transport::Mode::Tls) {
+            std::cout << "TLS policy="
+                      << secure_transport::tls_version_policy_name(tls_config.version_policy)
+                      << " mTLS=required session_resumption=disabled early_data=disabled library="
+                      << secure_transport::runtime_version() << '\n';
+        }
 
         std::random_device random_device;
         std::mt19937 rng(random_device());
-        BoundedWorkerPool pool(worker_count, queue_capacity, server_ip, server_port);
+        BoundedWorkerPool pool(worker_count, queue_capacity, server_ip, server_port,
+                               transport_mode, std::move(tls_context),
+                               tls_config.expected_server_name);
 
         std::size_t round = 0;
         bool any_request_failed = false;
@@ -958,6 +1177,9 @@ int main(int argc, char* argv[]) {
                       << requests_per_second
                       << " successful_MiB_per_second=" << successful_mib_per_second
                       << std::endl;
+            if (transport_mode == secure_transport::Mode::Tls && success != 0) {
+                std::cout << "negotiated_tls=" << pool.tls_negotiation_summary() << '\n';
+            }
             if (verbose_output) {
                 for (const auto& result : round_state->results) {
                     std::cout << "----------------------------------------\n";

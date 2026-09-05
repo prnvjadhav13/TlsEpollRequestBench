@@ -2,10 +2,18 @@ CXX ?= g++
 CPPFLAGS ?=
 CXXFLAGS ?=
 LDFLAGS ?=
+LDLIBS ?=
 
 COMMON_FLAGS := -std=c++23 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -pthread
-COMMON_HEADERS := tcp_common_config.h
-SERVER_HEADERS := $(COMMON_HEADERS) tcp_server_epoll.h
+OPENSSL_CPPFLAGS := $(shell pkg-config --cflags openssl)
+OPENSSL_LIBS := $(shell pkg-config --libs openssl)
+CPPFLAGS += $(OPENSSL_CPPFLAGS)
+CPPFLAGS += -I. -Iinclude
+LDLIBS += $(OPENSSL_LIBS)
+
+COMMON_HEADERS := tcp_common_config.h secure_transport.h
+COMMON_SOURCES := secure_transport.cpp src/runtime/bounded_executor.cpp
+SERVER_HEADERS := $(COMMON_HEADERS) server_protocol.h tcp_server_epoll.h
 
 BUILD_DIR := build
 DEBUG_DIR := $(BUILD_DIR)/debug
@@ -25,7 +33,7 @@ PERFORMANCE_LDFLAGS := -flto
 
 .DEFAULT_GOAL := production
 
-.PHONY: all debug development sanitizer production release performance clean help
+.PHONY: all debug development sanitizer production release performance test clean help
 
 all: debug sanitizer production performance
 
@@ -41,32 +49,38 @@ production: $(PRODUCTION_DIR)/tcp_server_epoll $(PRODUCTION_DIR)/tcp_client
 
 performance: $(PERFORMANCE_DIR)/tcp_server_epoll $(PERFORMANCE_DIR)/tcp_client
 
+test: $(DEBUG_DIR)/runtime_contract_test
+	$(DEBUG_DIR)/runtime_contract_test
+
 $(DEBUG_DIR) $(SANITIZER_DIR) $(PRODUCTION_DIR) $(PERFORMANCE_DIR):
 	mkdir -p $@
 
-$(DEBUG_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(SERVER_HEADERS) Makefile | $(DEBUG_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(DEBUG_FLAGS) $< -o $@ $(LDFLAGS)
+$(DEBUG_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(COMMON_SOURCES) $(SERVER_HEADERS) Makefile | $(DEBUG_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(DEBUG_FLAGS) tcp_server_epoll.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(LDLIBS)
 
-$(DEBUG_DIR)/tcp_client: tcp_client.cpp $(COMMON_HEADERS) Makefile | $(DEBUG_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(DEBUG_FLAGS) $< -o $@ $(LDFLAGS)
+$(DEBUG_DIR)/tcp_client: tcp_client.cpp $(COMMON_SOURCES) $(COMMON_HEADERS) Makefile | $(DEBUG_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(DEBUG_FLAGS) tcp_client.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(LDLIBS)
 
-$(SANITIZER_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(SERVER_HEADERS) Makefile | $(SANITIZER_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(SANITIZER_FLAGS) $< -o $@ $(LDFLAGS) $(SANITIZER_LDFLAGS)
+$(DEBUG_DIR)/runtime_contract_test: tests/runtime_contract_test.cpp src/runtime/bounded_executor.cpp include/epoll_runtime/bounded_executor.h include/epoll_runtime/completion_queue.h include/epoll_runtime/connection_id.h include/epoll_runtime/protocol.h Makefile | $(DEBUG_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(DEBUG_FLAGS) tests/runtime_contract_test.cpp src/runtime/bounded_executor.cpp -o $@ $(LDFLAGS)
 
-$(SANITIZER_DIR)/tcp_client: tcp_client.cpp $(COMMON_HEADERS) Makefile | $(SANITIZER_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(SANITIZER_FLAGS) $< -o $@ $(LDFLAGS) $(SANITIZER_LDFLAGS)
+$(SANITIZER_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(COMMON_SOURCES) $(SERVER_HEADERS) Makefile | $(SANITIZER_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(SANITIZER_FLAGS) tcp_server_epoll.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(SANITIZER_LDFLAGS) $(LDLIBS)
 
-$(PRODUCTION_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(SERVER_HEADERS) Makefile | $(PRODUCTION_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PRODUCTION_FLAGS) $< -o $@ $(LDFLAGS) $(PRODUCTION_LDFLAGS)
+$(SANITIZER_DIR)/tcp_client: tcp_client.cpp $(COMMON_SOURCES) $(COMMON_HEADERS) Makefile | $(SANITIZER_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(SANITIZER_FLAGS) tcp_client.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(SANITIZER_LDFLAGS) $(LDLIBS)
 
-$(PRODUCTION_DIR)/tcp_client: tcp_client.cpp $(COMMON_HEADERS) Makefile | $(PRODUCTION_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PRODUCTION_FLAGS) $< -o $@ $(LDFLAGS) $(PRODUCTION_LDFLAGS)
+$(PRODUCTION_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(COMMON_SOURCES) $(SERVER_HEADERS) Makefile | $(PRODUCTION_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PRODUCTION_FLAGS) tcp_server_epoll.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(PRODUCTION_LDFLAGS) $(LDLIBS)
 
-$(PERFORMANCE_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(SERVER_HEADERS) Makefile | $(PERFORMANCE_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PERFORMANCE_FLAGS) $< -o $@ $(LDFLAGS) $(PERFORMANCE_LDFLAGS)
+$(PRODUCTION_DIR)/tcp_client: tcp_client.cpp $(COMMON_SOURCES) $(COMMON_HEADERS) Makefile | $(PRODUCTION_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PRODUCTION_FLAGS) tcp_client.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(PRODUCTION_LDFLAGS) $(LDLIBS)
 
-$(PERFORMANCE_DIR)/tcp_client: tcp_client.cpp $(COMMON_HEADERS) Makefile | $(PERFORMANCE_DIR)
-	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PERFORMANCE_FLAGS) $< -o $@ $(LDFLAGS) $(PERFORMANCE_LDFLAGS)
+$(PERFORMANCE_DIR)/tcp_server_epoll: tcp_server_epoll.cpp $(COMMON_SOURCES) $(SERVER_HEADERS) Makefile | $(PERFORMANCE_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PERFORMANCE_FLAGS) tcp_server_epoll.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(PERFORMANCE_LDFLAGS) $(LDLIBS)
+
+$(PERFORMANCE_DIR)/tcp_client: tcp_client.cpp $(COMMON_SOURCES) $(COMMON_HEADERS) Makefile | $(PERFORMANCE_DIR)
+	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(CXXFLAGS) $(PERFORMANCE_FLAGS) tcp_client.cpp $(COMMON_SOURCES) -o $@ $(LDFLAGS) $(PERFORMANCE_LDFLAGS) $(LDLIBS)
 
 clean:
 	rm -rf -- $(BUILD_DIR)
@@ -77,6 +91,7 @@ help:
 	@echo "  make sanitizer     AddressSanitizer + UndefinedBehaviorSanitizer build"
 	@echo "  make production    Optimized, portable, hardened production-test build (default)"
 	@echo "  make performance   Maximum local-CPU optimization for benchmarking"
+	@echo "  make test          Run reusable runtime contract tests"
 	@echo "  make all           Build every variant"
 	@echo "  make clean         Remove the build directory"
 	@echo

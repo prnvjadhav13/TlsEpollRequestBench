@@ -1,0 +1,39 @@
+# Build products
+/build/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/compile_commands.json
+/cmake_install.cmake
+/install_manifest.txt
+/CTestTestfile.cmake
+
+# Generated benchmark data
+/*.bin
+/*.bin.tmp.*
+/client_request_keys.txt
+/server_request_response_mapping.bin
+
+# Certificates, private keys, and runtime credentials
+/cert/
+/certs/
+*.key
+*.key.pem
+*.p12
+*.pfx
+*.pass
+*.password
+*.secret
+
+# Runtime output and crash dumps
+*.log
+*.pid
+core
+core.*
+
+# Editor and operating-system files
+/.idea/
+/.vscode/
+*.swp
+*~
+.DS_Store
