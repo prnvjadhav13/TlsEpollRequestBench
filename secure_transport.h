@@ -23,7 +23,10 @@ public:
     [[nodiscard]] int copy_to(char* buffer, int buffer_size) const noexcept;
 
 private:
+    struct SharedEnabler;
     explicit PrivateKeyPassphrase(std::vector<char> value);
+    [[nodiscard]] static std::shared_ptr<const PrivateKeyPassphrase> create(
+        std::vector<char> value);
     friend std::shared_ptr<const PrivateKeyPassphrase>
         load_private_key_passphrase_file(const std::string& path);
     friend class TlsContext;
@@ -84,9 +87,16 @@ public:
         const ClientTlsConfig& config);
 
 private:
-    TlsContext(SSL_CTX* context, std::vector<std::string> allowed_peer_sans) noexcept;
+    struct ContextDeleter {
+        void operator()(SSL_CTX* context) const noexcept;
+    };
+    struct SharedEnabler;
+    using ContextPtr = std::unique_ptr<SSL_CTX, ContextDeleter>;
+
+    TlsContext(ContextPtr context,
+               std::vector<std::string> allowed_peer_sans) noexcept;
     friend class TlsSession;
-    SSL_CTX* context_ = nullptr;
+    ContextPtr context_;
     std::vector<std::string> allowed_peer_sans_;
 };
 
@@ -139,11 +149,16 @@ public:
     [[nodiscard]] const std::string& last_error() const noexcept;
 
 private:
+    struct SessionDeleter {
+        void operator()(SSL* session) const noexcept;
+    };
+    using SessionPtr = std::unique_ptr<SSL, SessionDeleter>;
+
     [[nodiscard]] IoStatus classify(int result, std::size_t bytes) noexcept;
     void capture_errors(std::string_view operation) noexcept;
 
     std::shared_ptr<TlsContext> context_;
-    SSL* ssl_ = nullptr;
+    SessionPtr ssl_;
     std::string last_error_;
 };
 

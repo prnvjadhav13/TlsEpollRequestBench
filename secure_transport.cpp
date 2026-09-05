@@ -149,6 +149,16 @@ void load_identity(SSL_CTX* context,
 PrivateKeyPassphrase::PrivateKeyPassphrase(std::vector<char> value)
     : value_(std::move(value)) {}
 
+struct PrivateKeyPassphrase::SharedEnabler final : PrivateKeyPassphrase {
+    explicit SharedEnabler(std::vector<char> value)
+        : PrivateKeyPassphrase(std::move(value)) {}
+};
+
+std::shared_ptr<const PrivateKeyPassphrase> PrivateKeyPassphrase::create(
+    std::vector<char> value) {
+    return std::make_shared<SharedEnabler>(std::move(value));
+}
+
 PrivateKeyPassphrase::~PrivateKeyPassphrase() noexcept {
     if (!value_.empty()) {
         OPENSSL_cleanse(value_.data(), value_.size());
@@ -232,8 +242,9 @@ load_private_key_passphrase_file(const std::string& path) {
     if (value.empty() || std::find(value.begin(), value.end(), '\0') != value.end()) {
         throw std::runtime_error("private-key passphrase file is empty or contains a NUL byte");
     }
-    auto result = std::shared_ptr<const PrivateKeyPassphrase>(
-        new PrivateKeyPassphrase(std::move(value)));
+    // Keep cleansing the source until ownership has transferred successfully.
+    // If allocation throws, value_cleanser still erases the passphrase.
+    auto result = PrivateKeyPassphrase::create(std::move(value));
     value_cleanser.active = false;
     return result;
 }
@@ -282,26 +293,25 @@ std::string runtime_version() {
     return OpenSSL_version(OPENSSL_VERSION);
 }
 
-TlsContext::TlsContext(SSL_CTX* context,
+void TlsContext::ContextDeleter::operator()(SSL_CTX* context) const noexcept {
+    SSL_CTX_free(context);
+}
+
+struct TlsContext::SharedEnabler final : TlsContext {
+    SharedEnabler(ContextPtr context, std::vector<std::string> allowed_peer_sans)
+        : TlsContext(std::move(context), std::move(allowed_peer_sans)) {}
+};
+
+TlsContext::TlsContext(ContextPtr context,
                        std::vector<std::string> allowed_peer_sans) noexcept
-    : context_(context), allowed_peer_sans_(std::move(allowed_peer_sans)) {}
+    : context_(std::move(context)),
+      allowed_peer_sans_(std::move(allowed_peer_sans)) {}
 
-TlsContext::~TlsContext() noexcept {
-    SSL_CTX_free(context_);
-}
+TlsContext::~TlsContext() noexcept = default;
 
-TlsContext::TlsContext(TlsContext&& other) noexcept
-    : context_(std::exchange(other.context_, nullptr)),
-      allowed_peer_sans_(std::move(other.allowed_peer_sans_)) {}
+TlsContext::TlsContext(TlsContext&& other) noexcept = default;
 
-TlsContext& TlsContext::operator=(TlsContext&& other) noexcept {
-    if (this != &other) {
-        SSL_CTX_free(context_);
-        context_ = std::exchange(other.context_, nullptr);
-        allowed_peer_sans_ = std::move(other.allowed_peer_sans_);
-    }
-    return *this;
-}
+TlsContext& TlsContext::operator=(TlsContext&& other) noexcept = default;
 
 TlsContextStore::TlsContextStore(std::shared_ptr<TlsContext> initial) noexcept
     : current_(std::move(initial)) {}
@@ -321,7 +331,7 @@ std::shared_ptr<TlsContext> TlsContext::make_server(const ServerTlsConfig& confi
     ERR_clear_error();
     SSL_CTX* raw = SSL_CTX_new(TLS_server_method());
     require(raw != nullptr, "create server TLS context");
-    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> guard(raw, &SSL_CTX_free);
+    ContextPtr guard(raw);
     configure_common(raw, config.version_policy);
     load_identity(raw, config.certificate_chain_file, config.private_key_file, "SERVER",
                   config.private_key_passphrase);
@@ -338,8 +348,7 @@ std::shared_ptr<TlsContext> TlsContext::make_server(const ServerTlsConfig& confi
     auto allowed = config.allowed_client_sans;
     std::sort(allowed.begin(), allowed.end());
     allowed.erase(std::unique(allowed.begin(), allowed.end()), allowed.end());
-    return std::shared_ptr<TlsContext>(
-        new TlsContext(guard.release(), std::move(allowed)));
+    return std::make_shared<SharedEnabler>(std::move(guard), std::move(allowed));
 }
 
 std::shared_ptr<TlsContext> TlsContext::make_client(const ClientTlsConfig& config) {
@@ -349,7 +358,7 @@ std::shared_ptr<TlsContext> TlsContext::make_client(const ClientTlsConfig& confi
     ERR_clear_error();
     SSL_CTX* raw = SSL_CTX_new(TLS_client_method());
     require(raw != nullptr, "create client TLS context");
-    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> guard(raw, &SSL_CTX_free);
+    ContextPtr guard(raw);
     configure_common(raw, config.version_policy);
     load_identity(raw, config.certificate_chain_file, config.private_key_file, "CLIENT",
                   config.private_key_passphrase);
@@ -359,7 +368,11 @@ std::shared_ptr<TlsContext> TlsContext::make_client(const ClientTlsConfig& confi
     SSL_CTX_set_verify(raw, SSL_VERIFY_PEER, nullptr);
     load_crl(raw, config.server_crl_file);
     SSL_CTX_set_session_cache_mode(raw, SSL_SESS_CACHE_OFF);
-    return std::shared_ptr<TlsContext>(new TlsContext(guard.release(), {}));
+    return std::make_shared<SharedEnabler>(std::move(guard), std::vector<std::string>{});
+}
+
+void TlsSession::SessionDeleter::operator()(SSL* session) const noexcept {
+    SSL_free(session);
 }
 
 TlsSession::TlsSession(std::shared_ptr<TlsContext> context,
@@ -371,9 +384,9 @@ TlsSession::TlsSession(std::shared_ptr<TlsContext> context,
         throw std::invalid_argument("TLS session requires a context and valid socket");
     }
     ERR_clear_error();
-    SSL* raw_ssl = SSL_new(context_->context_);
+    SSL* raw_ssl = SSL_new(context_->context_.get());
     require(raw_ssl != nullptr, "create TLS session");
-    std::unique_ptr<SSL, decltype(&SSL_free)> guard(raw_ssl, &SSL_free);
+    SessionPtr guard(raw_ssl);
     require(SSL_set_fd(raw_ssl, fd) == 1, "attach TLS session to socket");
     if (server) {
         SSL_set_accept_state(raw_ssl);
@@ -394,27 +407,14 @@ TlsSession::TlsSession(std::shared_ptr<TlsContext> context,
         }
         SSL_set_connect_state(raw_ssl);
     }
-    ssl_ = guard.release();
+    ssl_ = std::move(guard);
 }
 
-TlsSession::~TlsSession() noexcept {
-    SSL_free(ssl_);
-}
+TlsSession::~TlsSession() noexcept = default;
 
-TlsSession::TlsSession(TlsSession&& other) noexcept
-    : context_(std::move(other.context_)),
-      ssl_(std::exchange(other.ssl_, nullptr)),
-      last_error_(std::move(other.last_error_)) {}
+TlsSession::TlsSession(TlsSession&& other) noexcept = default;
 
-TlsSession& TlsSession::operator=(TlsSession&& other) noexcept {
-    if (this != &other) {
-        SSL_free(ssl_);
-        context_ = std::move(other.context_);
-        ssl_ = std::exchange(other.ssl_, nullptr);
-        last_error_ = std::move(other.last_error_);
-    }
-    return *this;
-}
+TlsSession& TlsSession::operator=(TlsSession&& other) noexcept = default;
 
 void TlsSession::capture_errors(std::string_view operation) noexcept {
     try {
@@ -425,7 +425,7 @@ void TlsSession::capture_errors(std::string_view operation) noexcept {
 }
 
 IoStatus TlsSession::classify(int result, std::size_t) noexcept {
-    const int error = SSL_get_error(ssl_, result);
+    const int error = SSL_get_error(ssl_.get(), result);
     switch (error) {
     case SSL_ERROR_WANT_READ:
         return IoStatus::WantRead;
@@ -441,14 +441,14 @@ IoStatus TlsSession::classify(int result, std::size_t) noexcept {
 
 IoStatus TlsSession::handshake() noexcept {
     ERR_clear_error();
-    const int result = SSL_do_handshake(ssl_);
+    const int result = SSL_do_handshake(ssl_.get());
     return result == 1 ? IoStatus::Complete : classify(result, 0);
 }
 
 IoResult TlsSession::read(std::span<std::byte> destination) noexcept {
     ERR_clear_error();
     std::size_t bytes = 0;
-    const int result = SSL_read_ex(ssl_, destination.data(), destination.size(), &bytes);
+    const int result = SSL_read_ex(ssl_.get(), destination.data(), destination.size(), &bytes);
     return result == 1 ? IoResult{IoStatus::Complete, bytes}
                        : IoResult{classify(result, bytes), 0};
 }
@@ -456,14 +456,14 @@ IoResult TlsSession::read(std::span<std::byte> destination) noexcept {
 IoResult TlsSession::write(std::span<const std::byte> source) noexcept {
     ERR_clear_error();
     std::size_t bytes = 0;
-    const int result = SSL_write_ex(ssl_, source.data(), source.size(), &bytes);
+    const int result = SSL_write_ex(ssl_.get(), source.data(), source.size(), &bytes);
     return result == 1 ? IoResult{IoStatus::Complete, bytes}
                        : IoResult{classify(result, bytes), 0};
 }
 
 IoStatus TlsSession::shutdown() noexcept {
     ERR_clear_error();
-    const int result = SSL_shutdown(ssl_);
+    const int result = SSL_shutdown(ssl_.get());
     if (result == 1) {
         return IoStatus::Complete;
     }
@@ -474,12 +474,12 @@ IoStatus TlsSession::shutdown() noexcept {
 }
 
 bool TlsSession::has_buffered_plaintext() const noexcept {
-    return SSL_pending(ssl_) > 0;
+    return SSL_pending(ssl_.get()) > 0;
 }
 
 bool TlsSession::peer_verified() const noexcept {
-    return SSL_get_verify_result(ssl_) == X509_V_OK &&
-           SSL_get0_peer_certificate(ssl_) != nullptr;
+    return SSL_get_verify_result(ssl_.get()) == X509_V_OK &&
+           SSL_get0_peer_certificate(ssl_.get()) != nullptr;
 }
 
 bool TlsSession::peer_authorized() const {
@@ -496,21 +496,21 @@ bool TlsSession::peer_authorized() const {
 }
 
 std::string TlsSession::negotiated_version() const {
-    return SSL_get_version(ssl_);
+    return SSL_get_version(ssl_.get());
 }
 
 std::string TlsSession::negotiated_cipher() const {
-    const char* cipher = SSL_get_cipher_name(ssl_);
+    const char* cipher = SSL_get_cipher_name(ssl_.get());
     return cipher == nullptr ? "unknown" : cipher;
 }
 
 bool TlsSession::session_reused() const noexcept {
-    return SSL_session_reused(ssl_) == 1;
+    return SSL_session_reused(ssl_.get()) == 1;
 }
 
 std::vector<std::string> TlsSession::peer_san_identities() const {
     std::vector<std::string> identities;
-    X509* certificate = SSL_get0_peer_certificate(ssl_);
+    X509* certificate = SSL_get0_peer_certificate(ssl_.get());
     if (certificate == nullptr) {
         return identities;
     }
